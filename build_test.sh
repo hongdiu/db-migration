@@ -11,6 +11,6 @@ go test . -count=1 -timeout 120s
 
 echo "=== [3/3] go build 构建可执行程序 ==="
 mkdir -p bin
-go build -o bin/dbmigration ./cmd/dbmigration
+go build -o bin/dbmigration .
 
 echo "=== 全部通过 ==="

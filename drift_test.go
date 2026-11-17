@@ -1,4 +1,4 @@
-package dbmigration
+package main
 
 import (
 	"testing"
