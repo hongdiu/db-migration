@@ -1,0 +1,162 @@
+// 校验引擎：记录数、主键分块计数、数值列求和与最值。
+//
+// 设计原则：
+//   - 校验对象是"每个分块两侧是否对齐"，不是"总数差不多"。总数相等但分块对不上，说明迁错了行。
+//   - 分块结果既是校验项，也是后续删除的门禁：只有校验通过的分块才允许删。
+//   - 所有判定走 CompareNumbers，按字段类型分派精确或容差比对。
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+)
+
+// CheckResult 是单个核对项的结果。
+type CheckResult struct {
+	Label   string // 核对项名称，如 "记录数"、"分块[0,99999]计数"
+	Pass    bool
+	Detail  string
+	BlockLo int64 // 关联的主键分块下界；非分块项为 0
+	BlockHi int64 // 关联的主键分块上界；非分块项为 0
+}
+
+// BlockRange 是一个主键分块区间 [lo, hi]。
+type BlockRange struct {
+	Lo int64
+	Hi int64
+}
+
+// MakeBlocks 按 blockSize 把 [minKey, maxKey] 切成若干分块。
+// minKey > maxKey（空表）时返回空切片。
+func MakeBlocks(minKey, maxKey, blockSize int64) []BlockRange {
+	if blockSize <= 0 || minKey > maxKey {
+		return nil
+	}
+	var blocks []BlockRange
+	for lo := minKey; lo <= maxKey; {
+		hi := lo + blockSize - 1
+		if hi < lo || hi > maxKey { // 防止整数溢出
+			hi = maxKey
+		}
+		blocks = append(blocks, BlockRange{Lo: lo, Hi: hi})
+		if hi == maxKey {
+			break
+		}
+		lo = hi + 1
+	}
+	return blocks
+}
+
+// JudgeCounts 判定两个计数是否相等（记录数和分块计数都是零容差）。
+func JudgeCounts(label string, srcCount, dstCount int64, block BlockRange) CheckResult {
+	r := CheckResult{Label: label, BlockLo: block.Lo, BlockHi: block.Hi}
+	if srcCount == dstCount {
+		r.Pass = true
+		r.Detail = fmt.Sprintf("两侧均为 %d 行", srcCount)
+	} else {
+		r.Detail = fmt.Sprintf("行数不等：源=%d，归档=%d，差=%d", srcCount, dstCount, srcCount-dstCount)
+	}
+	return r
+}
+
+// JudgeNumericAggregate 按字段类型判定一个聚合值（求和或最值）。
+func JudgeNumericAggregate(label string, src, dst string, kind NumericKind, absTol, relTol float64, nullable bool) CheckResult {
+	r := CheckResult{Label: label}
+	// 从数据库读出的 NULL 用 sql.NullString 语义识别：这里约定空表示 NULL 由调用方传入 IsNull。
+	sv, dv := TextValue(src), TextValue(dst)
+	ok, detail := CompareNumbers(sv, dv, kind, absTol, relTol)
+	r.Pass = ok
+	r.Detail = detail
+	if nullable {
+		r.Detail += "（该列可空，NULL 已按独立值处理）"
+	}
+	return r
+}
+
+// countRows 统计满足条件的行数。condition 为空则统计全表。
+func countRows(ctx context.Context, db *sql.DB, table, condition string) (int64, error) {
+	q := fmt.Sprintf("SELECT COUNT(*) FROM %s", qIdent(table))
+	if condition != "" {
+		q += " WHERE " + condition
+	}
+	var n int64
+	if err := db.QueryRowContext(ctx, q).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// countRowsInBlock 统计某个主键分块内的行数。
+func countRowsInBlock(ctx context.Context, db *sql.DB, table, keyCol, condition string, block BlockRange) (int64, error) {
+	where := fmt.Sprintf("%s BETWEEN %d AND %d", qIdent(keyCol), block.Lo, block.Hi)
+	if condition != "" {
+		where = "(" + condition + ") AND " + where
+	}
+	q := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", qIdent(table), where)
+	var n int64
+	if err := db.QueryRowContext(ctx, q).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// aggregateValue 读取某列在给定范围的聚合值（SUM/MIN/MAX），保留原始字符串避免精度丢失。
+// 聚合结果全为 NULL 时返回 IsNull=true。block 非空时额外限定主键区间。
+func aggregateValue(ctx context.Context, db *sql.DB, op, column, table, keyCol, condition string, block *BlockRange) (NumericValue, error) {
+	var clauses []string
+	if condition != "" {
+		clauses = append(clauses, "("+condition+")")
+	}
+	if block != nil {
+		clauses = append(clauses, fmt.Sprintf("%s BETWEEN %d AND %d", qIdent(keyCol), block.Lo, block.Hi))
+	}
+	where := ""
+	if len(clauses) > 0 {
+		where = " WHERE " + strings.Join(clauses, " AND ")
+	}
+	q := fmt.Sprintf("SELECT %s(%s) FROM %s%s", op, qIdent(column), qIdent(table), where)
+	var raw sql.NullString
+	if err := db.QueryRowContext(ctx, q).Scan(&raw); err != nil {
+		return NumericValue{}, err
+	}
+	if !raw.Valid {
+		return NullValue(), nil
+	}
+	return TextValue(raw.String), nil
+}
+
+// AllPassed 判断一组校验结果是否全部通过。
+func AllPassed(results []CheckResult) bool {
+	for _, r := range results {
+		if !r.Pass {
+			return false
+		}
+	}
+	return true
+}
+
+// FailedBlocks 收集校验未通过的分块区间，作为删除门禁的排除项。
+func FailedBlocks(results []CheckResult) []BlockRange {
+	var out []BlockRange
+	for _, r := range results {
+		if !r.Pass && (r.BlockLo != 0 || r.BlockHi != 0) {
+			out = append(out, BlockRange{Lo: r.BlockLo, Hi: r.BlockHi})
+		}
+	}
+	return out
+}
+
+// ResultsToReviewItems 把校验结果转成复查 SQL 里的工具判定汇总项。
+func ResultsToReviewItems(results []CheckResult) []ReviewItemResult {
+	out := make([]ReviewItemResult, 0, len(results))
+	for _, r := range results {
+		v := "不通过"
+		if r.Pass {
+			v = "通过"
+		}
+		out = append(out, ReviewItemResult{Label: r.Label, Verdict: v, Detail: r.Detail})
+	}
+	return out
+}
