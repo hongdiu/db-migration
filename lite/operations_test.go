@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildCopyQuery(t *testing.T) {
@@ -148,6 +149,89 @@ func TestJudgeCopyBatch(t *testing.T) {
 			t.Fatal("游标未前进应报错，避免死循环")
 		}
 	})
+}
+
+func TestProgressPercent(t *testing.T) {
+	cases := []struct {
+		name        string
+		done, total int64
+		want        int
+	}{
+		{"零进度", 0, 100, 0},
+		{"一半", 50, 100, 50},
+		{"未整除向下取整", 1, 3, 33},
+		{"完成", 100, 100, 100},
+		{"超过总数截断到100", 130, 100, 100},
+		{"总数为0视为完成", 5, 0, 100},
+		{"负数不越界", -1, 100, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ProgressPercent(tc.done, tc.total); got != tc.want {
+				t.Fatalf("ProgressPercent(%d,%d)=%d，期望 %d", tc.done, tc.total, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormatProgressBar(t *testing.T) {
+	cases := []struct {
+		percent, width int
+		want           string
+	}{
+		{0, 10, "[>         ]"},
+		{50, 10, "[=====>    ]"},
+		{100, 10, "[==========]"},
+		{130, 10, "[==========]"},
+		{-5, 10, "[>         ]"},
+		{50, 1, "[=>]"}, // 宽度最小强制为 2
+	}
+	for _, tc := range cases {
+		t.Run(tc.want, func(t *testing.T) {
+			if got := FormatProgressBar(tc.percent, tc.width); got != tc.want {
+				t.Fatalf("FormatProgressBar(%d,%d)=%q，期望 %q", tc.percent, tc.width, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormatCount(t *testing.T) {
+	cases := []struct {
+		in   int64
+		want string
+	}{
+		{0, "0"},
+		{999, "999"},
+		{1000, "1,000"},
+		{13057038, "13,057,038"},
+		{-1234567, "-1,234,567"},
+	}
+	for _, tc := range cases {
+		if got := FormatCount(tc.in); got != tc.want {
+			t.Fatalf("FormatCount(%d)=%q，期望 %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestFormatDuration(t *testing.T) {
+	if got := FormatDuration(32 * time.Second); got != "00:32" {
+		t.Fatalf("秒级格式不对: %s", got)
+	}
+	if got := FormatDuration(3723 * time.Second); got != "1:02:03" {
+		t.Fatalf("跨小时格式不对: %s", got)
+	}
+	if got := FormatDuration(-time.Second); got != "00:00" {
+		t.Fatalf("负数应归零: %s", got)
+	}
+}
+
+func TestBuildProgressLine(t *testing.T) {
+	line := BuildProgressLine(896188, 13057038, 6, 32*time.Second)
+	for _, want := range []string{"搬运进度:", "6%", "896,188", "13,057,038", "00:32"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("进度行缺少 %q: %s", want, line)
+		}
+	}
 }
 
 func TestJudgeCopyCounts(t *testing.T) {

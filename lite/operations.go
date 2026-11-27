@@ -11,7 +11,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // ============ 条件模式：分批搬运 ============
@@ -50,14 +52,102 @@ func BuildArchiveCountQuery(archive, condition string) string {
 	return q
 }
 
+// ProgressPercent 计算搬运完成百分比，截断到 0~100。
+// total<=0 表示没有命中数据，直接算作完成，避免除零。
+func ProgressPercent(done, total int64) int {
+	if total <= 0 {
+		return 100
+	}
+	if done <= 0 {
+		return 0
+	}
+	p := int(done * 100 / total)
+	if p > 100 {
+		return 100
+	}
+	return p
+}
+
+// FormatProgressBar 生成固定宽度的文本进度条，例如 "[====>     ]"。
+// 全部完成时全是等号，不再显示游标。
+func FormatProgressBar(percent, width int) string {
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	if width < 2 {
+		width = 2
+	}
+	filled := percent * width / 100
+	if filled > width {
+		filled = width
+	}
+	var sb strings.Builder
+	sb.WriteByte('[')
+	sb.WriteString(strings.Repeat("=", filled))
+	if filled < width {
+		sb.WriteByte('>')
+		sb.WriteString(strings.Repeat(" ", width-filled-1))
+	}
+	sb.WriteByte(']')
+	return sb.String()
+}
+
+// FormatCount 给整数加千分位逗号，便于阅读大数字。
+func FormatCount(n int64) string {
+	s := strconv.FormatInt(n, 10)
+	neg := strings.HasPrefix(s, "-")
+	if neg {
+		s = s[1:]
+	}
+	var sb strings.Builder
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteRune(c)
+	}
+	if neg {
+		return "-" + sb.String()
+	}
+	return sb.String()
+}
+
+// FormatDuration 把耗时格式化为 00:32 或 1:02:03。
+func FormatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	secs := int64(d / time.Second)
+	h := secs / 3600
+	m := (secs % 3600) / 60
+	s := secs % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%02d:%02d", m, s)
+}
+
+// BuildProgressLine 拼出一行完整进度提示。
+func BuildProgressLine(done, total int64, percent int, elapsed time.Duration) string {
+	return fmt.Sprintf("搬运进度: %s %3d%%  %s / %s  用时 %s",
+		FormatProgressBar(percent, 24), percent, FormatCount(done), FormatCount(total), FormatDuration(elapsed))
+}
+
 // RunCopy 执行条件模式的分批搬运，按批落进度。
-func RunCopy(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, keyCol string, columns []string, cp *Checkpoint) error {
+func RunCopy(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, keyCol string, columns []string, cp *Checkpoint, total int64) error {
 	var lastKey int64
 	var rowsDone int64
 	if cp != nil {
 		lastKey = cp.LastKey
 		rowsDone = cp.RowsDone
 	}
+	started := time.Now()
+	lastPercent := ProgressPercent(rowsDone, total) - 1 // 保证首批必定刷新一次
+	// 续跑时先把上次累计的进度显示出来，用户能立刻看到从哪接上。
+	fmt.Print("\r" + BuildProgressLine(rowsDone, total, lastPercent+1, 0))
 	for {
 		// 先读出本批命中条件的主键。列表为空才算真的没有更多数据。
 		// 不能用 INSERT ... ON DUPLICATE KEY UPDATE 的 RowsAffected 判断结束：
@@ -106,7 +196,14 @@ func RunCopy(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, keyCol s
 		if err := SaveCheckpoint(cfg.Checkpoint.Dir, t.Name, newCP); err != nil {
 			return err
 		}
+		// 只在百分比整数变化时刷新，避免每批都刷屏；日志重定向时最多约 100 行。
+		if pct := ProgressPercent(rowsDone, total); pct != lastPercent {
+			fmt.Print("\r" + BuildProgressLine(rowsDone, total, pct, time.Since(started)))
+			lastPercent = pct
+		}
 	}
+	// 确保最终进度是 100%，并换行，让后续的核对结果另起一行。
+	fmt.Print("\r" + BuildProgressLine(rowsDone, total, ProgressPercent(rowsDone, total), time.Since(started)) + "\n")
 	return nil
 }
 
