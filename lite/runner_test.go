@@ -5,6 +5,47 @@ import (
 	"testing"
 )
 
+func TestVerifyConclusionCallsOutMissingNumericFields(t *testing.T) {
+	// 回归：numeric_fields 为空时只跑了记录数/分块/抽样，不能输出"全部通过"。
+	none := verifyConclusion("orders", 5, 0)
+	if !strings.Contains(none, "未配置 verify.numeric_fields") || strings.Contains(none, "全部通过") {
+		t.Fatalf("未配置数值列时结论必须点明缺口，且不能说全部通过: %s", none)
+	}
+	full := verifyConclusion("orders", 12, 3)
+	if !strings.Contains(full, "校验全部通过（12 项）") {
+		t.Fatalf("配置了数值列时应给出常规结论: %s", full)
+	}
+}
+
+func TestPurgeFailureReviewSQLKeepsNumericFields(t *testing.T) {
+	// 回归：删除前校验未通过时，复查 SQL 曾把字段清单传成 nil，
+	// 结果只剩下记录数和抽样，被求和项拦下的人拿不到对应的核对 SQL。
+	tbl := &TableCfg{
+		Name:         "orders",
+		ArchiveTable: "orders_archive",
+		Condition:    "created_at < '2024-01-01'",
+	}
+	outcome := &VerifyOutcome{
+		Fields:           []ReviewField{{Name: "amount", Kind: NumericDecimal}},
+		Results:          []CheckResult{{Label: "amount 求和", Pass: false, Detail: "定点小数不相等"}},
+		KeyCol:           "id",
+		ArchiveCondition: "`id` > 5000",
+		Seed:             7,
+	}
+	got := buildPurgeFailureReviewSQL(tbl, outcome)
+	for _, want := range []string{
+		"-- [不通过] amount 求和：定点小数不相等",
+		"SELECT SUM(`amount`) AS 源表求和 FROM `orders`",
+		"SELECT SUM(`amount`) AS 归档表求和 FROM `orders_archive`",
+		"SELECT COUNT(`amount`) AS 源表非空数 FROM `orders`",
+		"SELECT COUNT(`amount`) AS 归档表非空数 FROM `orders_archive`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("删除失败复查 SQL 缺少 %q\n实际内容:\n%s", want, got)
+		}
+	}
+}
+
 func TestJudgePurgeProgress(t *testing.T) {
 	const fp = "fp123"
 
@@ -96,7 +137,7 @@ func TestReviewSQLWithArchiveCondition(t *testing.T) {
 	results := []ReviewItemResult{{Label: "记录数", Verdict: "通过", Detail: "两侧均为 10 行"}}
 
 	limited := BuildReviewSQLWithArchiveCondition("orders", "orders_archive", "created_at < '2024-01-01'",
-		"`id` > 5000", "id", fields, results, nil, 12345, 0.0001, 0.00001)
+		"`id` > 5000", "id", fields, results, nil, 12345, testTolerances())
 	if !strings.Contains(limited, "归档表校验范围") {
 		t.Fatalf("续跑复查 SQL 应注明范围: %s", limited)
 	}
@@ -111,7 +152,7 @@ func TestReviewSQLWithArchiveCondition(t *testing.T) {
 	}
 
 	// 全量校验时不应出现范围限制，保持原有输出不变。
-	plain := BuildReviewSQL("orders", "orders_archive", "", "id", fields, results, nil, 12345, 0.0001, 0.00001)
+	plain := BuildReviewSQL("orders", "orders_archive", "", "id", fields, results, nil, 12345, testTolerances())
 	if strings.Contains(plain, "`id` >") || strings.Contains(plain, "归档表校验范围") {
 		t.Fatalf("全量复查 SQL 不应带续跑范围: %s", plain)
 	}

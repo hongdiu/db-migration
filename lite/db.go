@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -77,11 +78,75 @@ func tableColumns(ctx context.Context, db *sql.DB, table string) ([]ColumnMeta, 
 	return cols, nil
 }
 
-// CompareTableStructure 比对源表与归档表的列定义（列名、完整类型、顺序）。
+// IndexMeta 是单个索引的元数据。
+type IndexMeta struct {
+	Name    string
+	Unique  bool
+	Columns []string
+}
+
+// tableIndexes 读取表的全部索引（同一索引的多列按 SEQ_IN_INDEX 顺序拼接）。
+func tableIndexes(ctx context.Context, db *sql.DB, table string) ([]IndexMeta, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT INDEX_NAME, NON_UNIQUE, IFNULL(COLUMN_NAME, '(表达式)')
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+		ORDER BY INDEX_NAME, SEQ_IN_INDEX`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	byName := make(map[string]*IndexMeta)
+	var order []string
+	for rows.Next() {
+		var name, col string
+		var nonUnique int
+		if err := rows.Scan(&name, &nonUnique, &col); err != nil {
+			return nil, err
+		}
+		idx, ok := byName[name]
+		if !ok {
+			idx = &IndexMeta{Name: name, Unique: nonUnique == 0}
+			byName[name] = idx
+			order = append(order, name)
+		}
+		idx.Columns = append(idx.Columns, col)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]IndexMeta, 0, len(order))
+	for _, name := range order {
+		out = append(out, *byName[name])
+	}
+	return out, nil
+}
+
+// indexSignature 把索引归一化成"是否唯一 + 列序列"。
+// 索引名只在表内唯一，跨表允许不同，所以比对时不能按名字比。
+func indexSignature(idx IndexMeta) string {
+	kind := "普通"
+	if idx.Unique {
+		kind = "唯一"
+	}
+	return kind + "(" + strings.Join(idx.Columns, ",") + ")"
+}
+
+// indexSignatures 把索引集合归一化并排序，便于忽略顺序后整体比对。
+func indexSignatures(idxs []IndexMeta) []string {
+	out := make([]string, 0, len(idxs))
+	for _, idx := range idxs {
+		out = append(out, indexSignature(idx))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// CompareTableStructure 比对源表与归档表的列定义（列名、完整类型、顺序）与索引。
 // 条件模式允许复用已存在的归档表（为了中断续跑），但前提是它确实是源表的副本。
 // 若列名相同而类型不同，写入时数据库会静默转换，校验又按同一套转换规则比对，
 // 可能一路"通过"却已经改了值，所以在搬运前就要拦住。
-func CompareTableStructure(srcTable, srcArchive string, src, dst []ColumnMeta) error {
+func CompareTableStructure(srcTable, srcArchive string, src, dst []ColumnMeta, srcIdx, dstIdx []IndexMeta) error {
 	if len(src) != len(dst) {
 		return fmt.Errorf("归档表 %s 与源表 %s 列数不一致：源表 %d 列，归档表 %d 列；请换用与源表结构一致的归档表",
 			srcArchive, srcTable, len(src), len(dst))
@@ -103,6 +168,13 @@ func CompareTableStructure(srcTable, srcArchive string, src, dst []ColumnMeta) e
 			return fmt.Errorf("列 %s 类型不一致：源表 %s，归档表 %s；类型不同会在写入时被静默转换，请换用与源表结构一致的归档表",
 				src[i].Name, srcType, dstType)
 		}
+	}
+	// 索引也要一致：归档表缺唯一索引时，依赖唯一键去重的写入行为不同；
+	// 多出唯一索引则可能让写入意外命中冲突。索引名跨表允许不同，只比唯一性与列序列。
+	srcSigs, dstSigs := indexSignatures(srcIdx), indexSignatures(dstIdx)
+	if strings.Join(srcSigs, "|") != strings.Join(dstSigs, "|") {
+		return fmt.Errorf("索引不一致：源表 [%s]，归档表 [%s]；索引差异会改变写入与去重行为，请换用与源表结构一致的归档表",
+			strings.Join(srcSigs, ", "), strings.Join(dstSigs, ", "))
 	}
 	return nil
 }
@@ -358,22 +430,61 @@ func probeOutboundForeignKeys(ctx context.Context, db *sql.DB, table string) ([]
 	return out, nil
 }
 
-// judgeRenameSideEffects 判断改名会让新表丢掉哪些对象。
+// probeAutoIncrementColumns 返回表里所有 AUTO_INCREMENT 列。
+// MySQL 允许自增列不是主键（只要它是某个索引的第一列），所以只探测主键会漏掉它们。
+func probeAutoIncrementColumns(ctx context.Context, db *sql.DB, table string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT COLUMN_NAME
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND EXTRA LIKE '%auto_increment%'
+		ORDER BY ORDINAL_POSITION`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// judgeRenameSideEffects 判断改名会让新表丢掉哪些对象或行为。
 // 只列事实并给出处置建议，是否继续由调用方按 -force 决定。
-func judgeRenameSideEffects(triggers []string, outFKs []DependencyInfo) error {
-	if len(triggers) == 0 && len(outFKs) == 0 {
+//   - triggers / outFKs：CREATE TABLE ... LIKE 不复制触发器与外键定义；
+//   - autoIncCols：自增计数器同样不会复制。只有"被对齐的主键"这一列能在改名后
+//     通过 ALTER TABLE ... AUTO_INCREMENT 恢复，其余自增列会从 1 重新发号。
+//     alignedKey 为空表示整张表都没做自增值对齐（无整型单列主键）。
+func judgeRenameSideEffects(triggers []string, outFKs []DependencyInfo, autoIncCols []string, alignedKey string) error {
+	var unsafeAutoInc []string
+	for _, col := range autoIncCols {
+		if alignedKey == "" || !strings.EqualFold(col, alignedKey) {
+			unsafeAutoInc = append(unsafeAutoInc, col)
+		}
+	}
+	if len(triggers) == 0 && len(outFKs) == 0 && len(unsafeAutoInc) == 0 {
 		return nil
 	}
 	var sb strings.Builder
-	sb.WriteString("源表上存在改名后新表不会带走的对象（CREATE TABLE ... LIKE 只复制列与索引，不复制触发器与外键定义）：")
+	sb.WriteString("源表上存在改名后新表不会带走的对象（CREATE TABLE ... LIKE 只复制列与索引，不复制触发器、外键定义和自增计数器）：")
 	for _, tr := range triggers {
 		sb.WriteString(fmt.Sprintf("\n  - 触发器: %s", tr))
 	}
 	for _, fk := range outFKs {
 		sb.WriteString(fmt.Sprintf("\n  - 外键: %s（引用 %s）", fk.Name, fk.Ref))
 	}
+	for _, col := range unsafeAutoInc {
+		sb.WriteString(fmt.Sprintf("\n  - 自增列: %s（新表从 1 重新发号，可能与归档数据或外部引用的编号重复）", col))
+	}
 	sb.WriteString("\n改名后这些对象会留在归档表上，顶替原表名的新空表没有它们：")
-	sb.WriteString("\n触发器对应的业务逻辑不再执行，外键约束也不再拦截孤儿数据。")
+	sb.WriteString("\n触发器对应的业务逻辑不再执行，外键约束也不再拦截孤儿数据，自增列可能重发已用过的编号。")
 	sb.WriteString("\n如确认可以接受，请自行在新表上重建，或加 -force 明确承担该后果后继续")
 	return fmt.Errorf("%s", sb.String())
 }

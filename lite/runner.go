@@ -61,6 +61,7 @@ func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey, seed
 		return nil, err
 	}
 	archiveCond := BuildSampleWhereByKey(keyCol, startKey)
+	tols := t.Verify.Tolerances()
 
 	var results []CheckResult
 
@@ -80,8 +81,14 @@ func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey, seed
 	if err != nil {
 		return nil, err
 	}
+	if len(fields) == 0 {
+		// 不能静默降级：不配数值列时，金额类差异只剩记录数、分块计数和抽样三道兜底，
+		// 结论里必须说清楚，否则"校验全部通过"会被误读成"数值也对过了"。
+		fmt.Printf("注意: 表 %s 未配置 verify.numeric_fields，本次跳过所有数值列的求和、最值与非空数校验；"+
+			"金额类数据只能靠记录数、分块计数和抽样发现差异。\n", t.Name)
+	}
 
-	// 3. 数值列求和与最值（按字段类型分派比对方式）。
+	// 3. 数值列求和、最值与非空数（按字段类型分派比对方式）。
 	for _, f := range fields {
 		srcSum, err := aggregateValue(ctx, db, "SUM", f.Name, t.Name, keyCol, t.Condition, nil)
 		if err != nil {
@@ -91,8 +98,19 @@ func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey, seed
 		if err != nil {
 			return nil, err
 		}
-		ok, detail := CompareNumbers(srcSum, dstSum, f.Kind, t.Verify.AbsTolerance, t.Verify.RelTolerance)
+		ok, detail := CompareNumbers(srcSum, dstSum, f.Kind, tols)
 		results = append(results, CheckResult{Label: fmt.Sprintf("%s 求和", f.Name), Pass: ok, Detail: detail})
+
+		// 非空数：SUM 相等但一侧是 NULL、另一侧是 0 时，只有这一项能区分。
+		srcNN, err := aggregateValue(ctx, db, "COUNT", f.Name, t.Name, keyCol, t.Condition, nil)
+		if err != nil {
+			return nil, err
+		}
+		dstNN, err := aggregateValue(ctx, db, "COUNT", f.Name, t.ArchiveTable, keyCol, archiveCond, nil)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, JudgeNonNullCounts(fmt.Sprintf("%s 非空数", f.Name), srcNN, dstNN))
 
 		for _, opName := range []string{"MIN", "MAX"} {
 			srcV, err := aggregateValue(ctx, db, opName, f.Name, t.Name, keyCol, t.Condition, nil)
@@ -103,7 +121,7 @@ func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey, seed
 			if err != nil {
 				return nil, err
 			}
-			ok2, detail2 := CompareNumbers(srcV, dstV, f.Kind, t.Verify.AbsTolerance, t.Verify.RelTolerance)
+			ok2, detail2 := CompareNumbers(srcV, dstV, f.Kind, tols)
 			results = append(results, CheckResult{Label: fmt.Sprintf("%s %s", f.Name, opName), Pass: ok2, Detail: detail2})
 		}
 	}
@@ -149,7 +167,7 @@ func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey, seed
 			return nil, err
 		}
 		for r, keys := range sampled {
-			verdict, err := CompareSampleRound(ctx, db, t.Name, t.ArchiveTable, keyCol, cols, kinds, keys, t.Verify.AbsTolerance, t.Verify.RelTolerance)
+			verdict, err := CompareSampleRound(ctx, db, t.Name, t.ArchiveTable, keyCol, cols, kinds, keys, tols)
 			if err != nil {
 				return nil, err
 			}
@@ -189,6 +207,7 @@ func DoSample(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 	if !t.Verify.SampleEnabled() {
 		return fmt.Errorf("抽样未开启：verify.sample_rounds 与 verify.sample_size 都必须大于 0")
 	}
+	tols := t.Verify.Tolerances()
 	sampled, err := SampleKeys(ctx, db, t.ArchiveTable, keyCol, rounds, size, seed)
 	if err != nil {
 		return err
@@ -200,7 +219,7 @@ func DoSample(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 
 	results := make([]CheckResult, 0, len(sampled))
 	for r, keys := range sampled {
-		verdict, err := CompareSampleRound(ctx, db, t.Name, t.ArchiveTable, keyCol, cols, kinds, keys, t.Verify.AbsTolerance, t.Verify.RelTolerance)
+		verdict, err := CompareSampleRound(ctx, db, t.Name, t.ArchiveTable, keyCol, cols, kinds, keys, tols)
 		if err != nil {
 			return err
 		}
@@ -217,7 +236,7 @@ func DoSample(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 		results = append(results, cr)
 	}
 
-	sqlText := BuildSampleReviewSQL(t.Name, t.ArchiveTable, t.Condition, keyCol, ResultsToReviewItems(results), sampled, seed, t.Verify.AbsTolerance, t.Verify.RelTolerance)
+	sqlText := BuildSampleReviewSQL(t.Name, t.ArchiveTable, t.Condition, keyCol, ResultsToReviewItems(results), sampled, seed, tols)
 	if _, err := OutputSampleSQL(cfg.Output.Dir, t.Name, seed, sqlText); err != nil {
 		return err
 	}
@@ -228,6 +247,17 @@ func DoSample(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 	return nil
 }
 
+// verifyConclusion 生成"校验通过"时的结论文案。
+// 未配置数值列时必须显式点出缺口：这类配置下金额差异只能靠记录数、分块和抽样兜底，
+// 一句笼统的"全部通过"会让人误以为数值列也核对过了。
+func verifyConclusion(table string, checkedItems, numericFields int) string {
+	if numericFields == 0 {
+		return fmt.Sprintf("表 %s 校验通过（%d 项），但未配置 verify.numeric_fields：数值列未做任何比对，"+
+			"这个结论不代表金额类数据已被核对。", table, checkedItems)
+	}
+	return fmt.Sprintf("表 %s 校验全部通过（%d 项）。", table, checkedItems)
+}
+
 // DoVerify 执行校验动作：跑校验 + 出复查 SQL（文件 + 控制台）。
 func DoVerify(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed int64) error {
 	outcome, err := RunVerify(ctx, db, t, seed)
@@ -236,14 +266,18 @@ func DoVerify(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 	}
 	results := outcome.Results
 	sqlText := BuildReviewSQLWithArchiveCondition(t.Name, t.ArchiveTable, t.Condition, outcome.ArchiveCondition, outcome.KeyCol, outcome.Fields,
-		ResultsToReviewItems(results), outcome.SampleRounds, outcome.Seed, t.Verify.AbsTolerance, t.Verify.RelTolerance)
+		ResultsToReviewItems(results), outcome.SampleRounds, outcome.Seed, t.Verify.Tolerances())
 	if _, err := OutputReviewSQL(cfg.Output.Dir, t.Name, sqlText); err != nil {
 		return err
 	}
 	if !AllPassed(results) {
 		return fmt.Errorf("校验未通过，请在上面的复查 SQL 中对照工具判定为[不通过]的项目排查；源表未做任何改动")
 	}
-	fmt.Printf("表 %s 校验全部通过（%d 项）。\n", t.Name, len(results))
+	if len(outcome.Fields) == 0 {
+		fmt.Println(verifyConclusion(t.Name, len(results), 0))
+		return nil
+	}
+	fmt.Println(verifyConclusion(t.Name, len(results), len(outcome.Fields)))
 	return nil
 }
 
@@ -266,7 +300,7 @@ func hasNewWrites(ctx context.Context, db *sql.DB, table, condition, keyCol stri
 }
 
 // JudgePurgeSamplingAllowed 判定是否允许在没有抽样的情况下执行删除。
-// 抽样是发现"两行数据互换"这类行级错位的唯一手段：记录数、求和、最值、分块计数
+// 抽样是发现"两行数据互换"这类行级错位的唯一手段：记录数、求和、最值、非空数、分块计数
 // 在对称错位时会全部相等，只有逐字段回读能抓出来。因此抽样被配置关掉时默认拒绝删除，
 // 必须显式加 -force 承担漏检风险。
 func JudgePurgeSamplingAllowed(sampleEnabled, force bool) error {
@@ -277,28 +311,48 @@ func JudgePurgeSamplingAllowed(sampleEnabled, force bool) error {
 		return nil
 	}
 	return fmt.Errorf("抽样已关闭（verify.sample_rounds 或 sample_size 为 0），purge 默认拒绝执行：" +
-		"抽样是发现\"两行数据互换\"这类行级错位的唯一手段，记录数/求和/最值/分块计数在这种情况下会全部相等。" +
-		"请把 verify.sample_rounds 与 verify.sample_size 设为大于 0 后重跑，或加 -force 明确承担漏检风险")
+		"抽样是发现\"两行数据互换\"这类行级错位的唯一手段，记录数/求和/最值/非空数/分块计数在这种情况下会全部相等。" +
+		"请加 -force 明确承担漏检风险后重跑。" +
+		"若要恢复抽样：抽样参数参与配置指纹，调整后旧删除进度会失效，必须重新搬运、重新校验")
+}
+
+// buildPurgeFailureReviewSQL 生成"删除前校验未通过"时的复查 SQL。
+// 必须带上 outcome.Fields：拦下删除的可能正是某个数值列的求和、最值或非空数，
+// 报告里缺了这些核对项，人拿到 SQL 也无法照着复查。
+func buildPurgeFailureReviewSQL(t *TableCfg, outcome *VerifyOutcome) string {
+	return BuildReviewSQLWithArchiveCondition(t.Name, t.ArchiveTable, t.Condition, outcome.ArchiveCondition,
+		outcome.KeyCol, outcome.Fields, ResultsToReviewItems(outcome.Results), outcome.SampleRounds,
+		outcome.Seed, t.Verify.Tolerances())
 }
 
 // RunPurge 执行删除动作：强制先校验，全部通过才按已校验主键清单分批删。
 // 支持中途中断后从进度文件续删；每批只按实际删除行数递减计数，不再重复全表统计。
+//
+// 每批的落盘顺序是"意图 → 删除 → 确认"：
+//   - 意图记录本批要删的区间和行数，此时进度仍停在这批之前；
+//   - DELETE 提交后再写一次进度，把这批并入 PurgeLastKey 并清掉意图。
+//
+// 这样即使进程在 DELETE 之后、确认写入之前被杀，重跑也能凭"源表区间内剩余行数"
+// 判断这批到底删没删，不必依赖"删除 + 写进度"在同一个事务里
+// （一批几万行的 DELETE 放进事务代价太高）。
 func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed int64, force bool) error {
+	fingerprint := ConfigFingerprint(*t)
+	cp, err := LoadCheckpoint(cfg.Checkpoint.Dir, t.Name)
+	if err != nil {
+		return err
+	}
+	// 已完成的表先返回：否则抽样被关掉时，重跑一张早就删完的表会先撞上抽样门禁并报错。
+	if cp != nil && cp.Stage == "purged" && cp.Fingerprint == fingerprint {
+		fmt.Printf("表 %s 已标记为删除完成，跳过；如需重做请删除进度文件。\n", t.Name)
+		return nil
+	}
 	if err := JudgePurgeSamplingAllowed(t.Verify.SampleEnabled(), force); err != nil {
 		return err
 	}
 	if !t.Verify.SampleEnabled() {
 		fmt.Println("警告: 抽样已关闭，行级错位只能靠记录数/求和/分块计数发现，可能漏检；已按 -force 继续。")
 	}
-	fingerprint := ConfigFingerprint(*t)
-	cp, err := LoadCheckpoint(cfg.Checkpoint.Dir, t.Name)
-	if err != nil {
-		return err
-	}
-	if cp != nil && cp.Stage == "purged" && cp.Fingerprint == fingerprint {
-		fmt.Printf("表 %s 已标记为删除完成，跳过；如需重做请删除进度文件。\n", t.Name)
-		return nil
-	}
+
 	progress, err := JudgePurgeProgress(cp, fingerprint)
 	if err != nil {
 		return err
@@ -309,20 +363,7 @@ func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 		fmt.Printf("表 %s 从断点续删：起点主键 %d，此前已删 %d 行。\n", t.Name, startKey, deletedSoFar)
 	}
 
-	// 删除前强制复核：续跑时只校验尚未删除的部分，已删部分不参与比对。
-	outcome, err := RunVerifyRange(ctx, db, t, startKey, seed)
-	if err != nil {
-		return err
-	}
-	results := outcome.Results
-	if !AllPassed(results) {
-		sqlText := BuildReviewSQLWithArchiveCondition(t.Name, t.ArchiveTable, t.Condition, outcome.ArchiveCondition, outcome.KeyCol, nil,
-			ResultsToReviewItems(results), outcome.SampleRounds, outcome.Seed, t.Verify.AbsTolerance, t.Verify.RelTolerance)
-		_, _ = OutputReviewSQL(cfg.Output.Dir, t.Name, sqlText)
-		return fmt.Errorf("删除前校验未通过，已停止；源表未做任何改动，请按复查 SQL 排查")
-	}
-
-	// 主键探测。
+	// 主键探测提前到这里：恢复未确认批次时要用它统计区间剩余行数。
 	pk, err := probePrimaryKey(ctx, db, t.Name)
 	if err != nil {
 		return err
@@ -330,6 +371,38 @@ func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 	keyCol, err := judgePrimaryKeyUsable(t.KeyColumn, pk)
 	if err != nil {
 		return err
+	}
+
+	// 恢复"已发起但未确认"的批次：按源表在该区间还剩多少行判断删除是否已生效。
+	if cp != nil && cp.PurgePendingRows > 0 {
+		remaining, err := countRowsInKeyRange(ctx, db, t.Name, keyCol, t.Condition, cp.PurgePendingFrom, cp.PurgePendingTo)
+		if err != nil {
+			return fmt.Errorf("核对上次未确认的删除批次失败: %w", err)
+		}
+		rec, err := JudgePendingPurge(cp, remaining)
+		if err != nil {
+			return err
+		}
+		if rec.Applied {
+			startKey, deletedSoFar = rec.StartKey, rec.Deleted
+			fmt.Printf("表 %s 上次删除的批次（主键 (%d, %d]，%d 行）已确认生效，进度已推进。\n",
+				t.Name, cp.PurgePendingFrom, cp.PurgePendingTo, cp.PurgePendingRows)
+		} else {
+			fmt.Printf("表 %s 上次删除的批次（主键 (%d, %d]）未生效，重新执行这一批。\n",
+				t.Name, cp.PurgePendingFrom, cp.PurgePendingTo)
+		}
+	}
+
+	// 删除前强制复核：续跑时只校验尚未删除的部分，已删部分不参与比对。
+	outcome, err := RunVerifyRange(ctx, db, t, startKey, seed)
+	if err != nil {
+		return err
+	}
+	results := outcome.Results
+	if !AllPassed(results) {
+		sqlText := buildPurgeFailureReviewSQL(t, outcome)
+		_, _ = OutputReviewSQL(cfg.Output.Dir, t.Name, sqlText)
+		return fmt.Errorf("删除前校验未通过，已停止；源表未做任何改动，请按复查 SQL 排查")
 	}
 
 	archiveRows, err := countRows(ctx, db, t.ArchiveTable, "")
@@ -394,6 +467,24 @@ func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 			return fmt.Errorf("删除守恒校验失败，已停止: %w", err)
 		}
 
+		// 先落删除意图：记录本批区间 (lastKey, keys[last]] 与计划行数，进度本体不动。
+		// 写失败就还没删，直接返回，不留半截状态。
+		intent := &Checkpoint{
+			Fingerprint:      fingerprint,
+			Table:            t.Name,
+			LastKey:          copyLastKey,
+			RowsDone:         copyRowsDone,
+			PurgeLastKey:     lastKey,
+			PurgeDeleted:     deletedSoFar,
+			PurgePendingFrom: lastKey,
+			PurgePendingTo:   keys[len(keys)-1],
+			PurgePendingRows: int64(len(keys)),
+			Stage:            "purging",
+		}
+		if err := SaveCheckpoint(cfg.Checkpoint.Dir, t.Name, intent); err != nil {
+			return fmt.Errorf("写删除意图失败，本批未开始删除: %w", err)
+		}
+
 		delSQL := BuildDeleteByKeys(t.Name, keyCol, keys)
 		res, err := db.ExecContext(ctx, delSQL)
 		if err != nil {
@@ -405,12 +496,13 @@ func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 		}
 		// 实际删除数与计划不符，说明数据被外部改动，立即停止，不继续带错往下删。
 		if affected != int64(len(keys)) {
-			return fmt.Errorf("本批计划删 %d 行，实际删 %d 行（数据可能被外部改动），已停止", len(keys), affected)
+			return fmt.Errorf("本批计划删 %d 行，实际删 %d 行（数据可能被外部改动），已停止；"+
+				"进度文件里保留着本批意图，重跑会按源表剩余行数自动核对", len(keys), affected)
 		}
 		srcRemaining, deletedSoFar = ApplyPurgeBatch(srcRemaining, deletedSoFar, affected)
 		lastKey = keys[len(keys)-1]
 
-		// 原子写续跑断点：搬运信息原样保留，追加删除进度。
+		// 确认落盘：把这批并入进度并清掉意图（pending 三个字段归零）。
 		next := &Checkpoint{
 			Fingerprint:  fingerprint,
 			Table:        t.Name,

@@ -379,8 +379,16 @@ func RunFullTable(ctx context.Context, db *sql.DB, t *TableCfg, force bool) erro
 		return err
 	}
 
-	// 预检三：本表自己的触发器与外键不会被 CREATE TABLE ... LIKE 复制到新空表。
-	// 这类副作用不破坏被归档的数据，但会让业务侧静默失去审计/同步/约束，默认拒绝，-force 放行。
+	// 自增值对齐只对整型单列主键可行；探测提前到这里，因为"哪一列会被对齐"
+	// 决定了改名后还有没有自增列会从 1 重新发号。
+	keyCol, skipReason, err := chooseAutoIncrementKey(ctx, db, t.Name, t.KeyColumn)
+	if err != nil {
+		return err
+	}
+
+	// 预检三：本表自己的触发器、外键、非主键自增列都不会被 CREATE TABLE ... LIKE 复制，
+	// 也不会随改名保留计数器。这类副作用不破坏被归档的数据，但会让业务侧静默失去
+	// 审计/同步/约束，或重发已用过的编号，默认拒绝，-force 放行。
 	triggers, err := probeTableTriggers(ctx, db, t.Name)
 	if err != nil {
 		return fmt.Errorf("检查触发器失败: %w", err)
@@ -389,11 +397,15 @@ func RunFullTable(ctx context.Context, db *sql.DB, t *TableCfg, force bool) erro
 	if err != nil {
 		return fmt.Errorf("检查外键失败: %w", err)
 	}
-	if sideErr := judgeRenameSideEffects(triggers, outFKs); sideErr != nil {
+	autoIncCols, err := probeAutoIncrementColumns(ctx, db, t.Name)
+	if err != nil {
+		return fmt.Errorf("检查自增列失败: %w", err)
+	}
+	if sideErr := judgeRenameSideEffects(triggers, outFKs, autoIncCols, keyCol); sideErr != nil {
 		if !force {
 			return sideErr
 		}
-		fmt.Printf("警告: %v\n已按 -force 继续，改名后原表名上的新空表不含上述对象。\n", sideErr)
+		fmt.Printf("警告: %v\n已按 -force 继续。请自行在新表上重建触发器与外键，并把其余自增列的计数器调到安全值。\n", sideErr)
 	}
 
 	// 空表临时名，确保不与现有对象冲突。
@@ -404,12 +416,6 @@ func RunFullTable(ctx context.Context, db *sql.DB, t *TableCfg, force bool) erro
 	}
 	if emptyExists {
 		return fmt.Errorf("临时空表 %s 已存在，请先清理残留", emptyTable)
-	}
-
-	// 自增值对齐：只有整型单列主键才需要、也才做得了。探测不到就跳过，不阻断改名。
-	keyCol, skipReason, err := chooseAutoIncrementKey(ctx, db, t.Name, t.KeyColumn)
-	if err != nil {
-		return err
 	}
 
 	// 建空表 →（可选）对齐自增值 → 原子改名。

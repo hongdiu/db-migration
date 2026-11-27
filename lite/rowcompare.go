@@ -30,7 +30,7 @@ type RowDiff struct {
 // srcRow / dstRow 都是 列名 -> 值 的映射，值用 NumericValue 保留 NULL 语义。
 // kinds 是列名 -> 数值类别（非数值列为 NumericNone）。
 // 返回该行的差异列表，空表示完全一致。
-func CompareSampledRow(key int64, columns []string, kinds map[string]NumericKind, srcRow, dstRow map[string]NumericValue, absTol, relTol float64) []RowDiff {
+func CompareSampledRow(key int64, columns []string, kinds map[string]NumericKind, srcRow, dstRow map[string]NumericValue, tols Tolerances) []RowDiff {
 	var diffs []RowDiff
 	for _, col := range columns {
 		sv, sok := srcRow[col]
@@ -40,7 +40,7 @@ func CompareSampledRow(key int64, columns []string, kinds map[string]NumericKind
 			continue
 		}
 		kind := kinds[col] // 非数值列为 NumericNone，CompareNumbers 走字符串精确比对
-		ok, reason := CompareNumbers(sv, dv, kind, absTol, relTol)
+		ok, reason := CompareNumbers(sv, dv, kind, tols)
 		if !ok {
 			diffs = append(diffs, RowDiff{Key: key, Column: col, Src: displayValue(sv), Dst: displayValue(dv), Reason: reason})
 		}
@@ -120,7 +120,7 @@ type SampleVerdict struct {
 }
 
 // CompareSampleRound 比对一轮抽样：逐主键回读两表全部字段并比对。
-func CompareSampleRound(ctx context.Context, db *sql.DB, source, archive, keyCol string, columns []string, kinds map[string]NumericKind, keys []int64, absTol, relTol float64) (SampleVerdict, error) {
+func CompareSampleRound(ctx context.Context, db *sql.DB, source, archive, keyCol string, columns []string, kinds map[string]NumericKind, keys []int64, tols Tolerances) (SampleVerdict, error) {
 	v := SampleVerdict{Round: 0, Pass: true, Sampled: len(keys)}
 	for _, key := range keys {
 		srcRow, err := readRow(ctx, db, source, columns, keyCol, key)
@@ -131,7 +131,7 @@ func CompareSampleRound(ctx context.Context, db *sql.DB, source, archive, keyCol
 		if err != nil {
 			return v, fmt.Errorf("回读归档表主键 %d 失败: %w", key, err)
 		}
-		diffs := CompareSampledRow(key, unquoteColumns(columns), kinds, srcRow, dstRow, absTol, relTol)
+		diffs := CompareSampledRow(key, unquoteColumns(columns), kinds, srcRow, dstRow, tols)
 		if len(diffs) > 0 {
 			v.Pass = false
 			v.Diffs = append(v.Diffs, diffs...)

@@ -87,8 +87,11 @@ func randomOffset(span uint64, rng *rand.Rand) uint64 {
 	if span == 0 {
 		return 0
 	}
+	// 跨度不超过 int63-1 时，Int63n 的上界是安全的（span+1 <= 2^63-1）。
+	// 恰好等于 int63 最大值时必须走 64 位分支：此时 int64(span)+1 会溢出成负数，
+	// Int63n 收到非正参数会 panic。
 	const maxInt63 = uint64(1<<63 - 1)
-	if span <= maxInt63 {
+	if span < maxInt63 {
 		return uint64(rng.Int63n(int64(span) + 1))
 	}
 	// 跨度超过 int63 能表示的范围：拼两个 63 位随机数得到 64 位随机值。

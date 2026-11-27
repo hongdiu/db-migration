@@ -31,6 +31,23 @@ tables:
       numeric_fields: [amount]
 `
 
+// TestExampleConfigParses 确保仓库里的示例配置与代码字段同步，
+// 避免文档改了字段名、示例却还在用旧名字这种"照抄就跑不起来"的问题。
+func TestExampleConfigParses(t *testing.T) {
+	cfg, err := LoadConfig("config.example.yaml")
+	if err != nil {
+		t.Fatalf("示例配置解析失败: %v", err)
+	}
+	if len(cfg.Tables) == 0 {
+		t.Fatal("示例配置应至少包含一张表")
+	}
+	for _, tbl := range cfg.Tables {
+		if tbl.Verify.DoubleAbsTolerance != 1e-9 || tbl.Verify.DoubleRelTolerance != 1e-12 {
+			t.Fatalf("示例配置里的 DOUBLE 容差未被识别: %+v", tbl.Verify)
+		}
+	}
+}
+
 func TestLoadConfigDefaults(t *testing.T) {
 	cfg, err := LoadConfig(writeTempConfig(t, validConfig))
 	if err != nil {
@@ -54,6 +71,14 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if tbl.Verify.AbsTolerance != 0.0001 || tbl.Verify.RelTolerance != 0.00001 {
 		t.Fatalf("容差默认值不对: %+v", tbl.Verify)
+	}
+	// DOUBLE 必须有自己的默认阈值，不能沿用 FLOAT 那一组。
+	if tbl.Verify.DoubleAbsTolerance != 1e-9 || tbl.Verify.DoubleRelTolerance != 1e-12 {
+		t.Fatalf("DOUBLE 容差默认值不对: abs=%g rel=%g", tbl.Verify.DoubleAbsTolerance, tbl.Verify.DoubleRelTolerance)
+	}
+	tols := tbl.Verify.Tolerances()
+	if tols.For(NumericDouble).Rel != 1e-12 || tols.For(NumericFloat).Rel != 0.00001 {
+		t.Fatalf("按类型取阈值不对: %+v", tols)
 	}
 	if tbl.Verify.Rounds() != 3 || tbl.Verify.PerRound() != 50 || !tbl.Verify.SampleEnabled() {
 		t.Fatalf("抽样默认值不对: rounds=%d size=%d", tbl.Verify.Rounds(), tbl.Verify.PerRound())

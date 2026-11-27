@@ -3,8 +3,48 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestJudgePendingPurge(t *testing.T) {
+	// 没有未确认批次：不进入恢复流程。
+	if rec, err := JudgePendingPurge(&Checkpoint{Stage: "purging", PurgeLastKey: 100}, 0); err != nil || rec.HasPending {
+		t.Fatalf("无意图时不应触发恢复: %+v err=%v", rec, err)
+	}
+
+	cp := &Checkpoint{
+		Stage: "purging", PurgeLastKey: 100, PurgeDeleted: 50,
+		PurgePendingFrom: 100, PurgePendingTo: 200, PurgePendingRows: 30,
+	}
+	// 区间内已无剩余行：这批确实删掉了，进度推到 200，累计行数补上 30。
+	rec, err := JudgePendingPurge(cp, 0)
+	if err != nil {
+		t.Fatalf("已删场景不应报错: %v", err)
+	}
+	if !rec.HasPending || !rec.Applied || rec.StartKey != 200 || rec.Deleted != 80 {
+		t.Fatalf("已删场景恢复结果不对: %+v", rec)
+	}
+	// 剩余行数等于计划行数：完全没删，进度保持原样，重试这一批。
+	rec, err = JudgePendingPurge(cp, 30)
+	if err != nil {
+		t.Fatalf("未删场景不应报错: %v", err)
+	}
+	if !rec.HasPending || rec.Applied || rec.StartKey != 0 || rec.Deleted != 0 {
+		t.Fatalf("未删场景应保持原进度: %+v", rec)
+	}
+	// 介于两者之间：可能有外部写入，不能猜。
+	if _, err := JudgePendingPurge(cp, 12); err == nil {
+		t.Fatal("部分剩余应拒绝自动判定")
+	} else if !strings.Contains(err.Error(), "无法自动判定") {
+		t.Fatalf("错误信息应说明无法自动判定: %v", err)
+	}
+	// 区间本身不合法：直接报错。
+	bad := &Checkpoint{PurgePendingFrom: 200, PurgePendingTo: 100, PurgePendingRows: 5}
+	if _, err := JudgePendingPurge(bad, 0); err == nil {
+		t.Fatal("区间倒置应报错")
+	}
+}
 
 func TestCheckpointRoundTrip(t *testing.T) {
 	dir := t.TempDir()

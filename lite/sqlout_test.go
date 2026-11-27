@@ -12,12 +12,13 @@ func TestBuildReviewSQLByType(t *testing.T) {
 		{Name: "amount", Kind: NumericDecimal},
 		{Name: "fee", Kind: NumericInteger},
 		{Name: "rate", Kind: NumericFloat},
+		{Name: "ratio", Kind: NumericDouble},
 		{Name: "note", Kind: NumericNone},
 	}
 	results := []ReviewItemResult{
 		{Label: "记录数", Verdict: "通过", Detail: "两侧均为 1000 行"},
 	}
-	sql := BuildReviewSQL("orders", "orders_archive", "created_at < '2024-01-01'", "id", fields, results, nil, 12345, 0.0001, 0.00001)
+	sql := BuildReviewSQL("orders", "orders_archive", "created_at < '2024-01-01'", "id", fields, results, nil, 12345, testTolerances())
 
 	// 整数列：零容差字样。
 	if !strings.Contains(sql, "字段 amount [定点小数] —— 零容差精确判定") {
@@ -27,14 +28,21 @@ func TestBuildReviewSQLByType(t *testing.T) {
 		t.Fatal("整数列应标注零容差精确判定")
 	}
 	// 浮点列：必须生成容差判定 SQL，且带具体阈值和 SET 变量。
-	if !strings.Contains(sql, "字段 rate [浮点] —— 容差判定") {
-		t.Fatal("浮点列应标注容差判定")
+	if !strings.Contains(sql, "字段 rate [浮点(FLOAT)] —— 容差判定") {
+		t.Fatal("FLOAT 列应标注容差判定")
 	}
 	if !strings.Contains(sql, "SET @src_sum") || !strings.Contains(sql, "SET @dst_sum") {
 		t.Fatal("浮点列应生成可直接运行的容差判定 SQL")
 	}
 	if !strings.Contains(sql, "0.0001 + 1e-05") {
-		t.Fatal("浮点容差 SQL 应带上具体阈值")
+		t.Fatal("FLOAT 容差 SQL 应带上具体阈值")
+	}
+	// DOUBLE 必须用自己的阈值，而不是沿用 FLOAT 那一组。
+	if !strings.Contains(sql, "字段 ratio [浮点(DOUBLE)] —— 容差判定") {
+		t.Fatal("DOUBLE 列应标注容差判定")
+	}
+	if !strings.Contains(sql, "1e-09 + 1e-12") {
+		t.Fatal("DOUBLE 容差 SQL 应使用 1e-9 / 1e-12，而不是 FLOAT 的阈值")
 	}
 	// 非数值列：不生成求和。
 	if !strings.Contains(sql, "字段 note [非数值]") {
@@ -56,7 +64,7 @@ func TestBuildReviewSQLByType(t *testing.T) {
 
 func TestBuildReviewSQLFullTable(t *testing.T) {
 	// 全表模式没有条件，两侧都不应带 WHERE。
-	sql := BuildReviewSQL("logs", "logs_archive", "", "id", nil, nil, nil, 12345, 0.0001, 0.00001)
+	sql := BuildReviewSQL("logs", "logs_archive", "", "id", nil, nil, nil, 12345, testTolerances())
 	if strings.Contains(sql, " WHERE ") {
 		t.Fatalf("全表模式复查 SQL 不应有 WHERE: %s", sql)
 	}
@@ -67,7 +75,7 @@ func TestBuildReviewSQLFullTable(t *testing.T) {
 
 func TestBuildReviewSQLSampleSection(t *testing.T) {
 	rounds := [][]int64{{1, 3, 5}, {7, 9}}
-	sql := BuildReviewSQL("orders", "orders_archive", "created_at < '2024-01-01'", "id", nil, nil, rounds, 12345, 0.0001, 0.00001)
+	sql := BuildReviewSQL("orders", "orders_archive", "created_at < '2024-01-01'", "id", nil, nil, rounds, 12345, testTolerances())
 	if !strings.Contains(sql, "核对项 4：随机抽样逐字段比对") {
 		t.Fatal("应包含抽样小节")
 	}
@@ -81,7 +89,7 @@ func TestBuildReviewSQLSampleSection(t *testing.T) {
 		t.Fatal("每轮都应有源表和归档表的回读 SQL")
 	}
 	// 未开启抽样时不应有抽样小节。
-	sql2 := BuildReviewSQL("orders", "orders_archive", "", "id", nil, nil, nil, 12345, 0.0001, 0.00001)
+	sql2 := BuildReviewSQL("orders", "orders_archive", "", "id", nil, nil, nil, 12345, testTolerances())
 	if strings.Contains(sql2, "核对项 4") {
 		t.Fatal("未开启抽样不应输出抽样小节")
 	}
@@ -89,12 +97,12 @@ func TestBuildReviewSQLSampleSection(t *testing.T) {
 
 func TestReviewSQLRecordsSampleSeed(t *testing.T) {
 	rounds := [][]int64{{1, 3, 5}}
-	sql := BuildReviewSQL("orders", "orders_archive", "", "id", nil, nil, rounds, 987654, 0.0001, 0.00001)
+	sql := BuildReviewSQL("orders", "orders_archive", "", "id", nil, nil, rounds, 987654, testTolerances())
 	if !strings.Contains(sql, "抽样种子: 987654") || !strings.Contains(sql, "-seed 987654") {
 		t.Fatalf("有抽样时应标注种子及复现参数: %s", sql)
 	}
 	// 未开启抽样时不写种子行。
-	sql2 := BuildReviewSQL("orders", "orders_archive", "", "id", nil, nil, nil, 987654, 0.0001, 0.00001)
+	sql2 := BuildReviewSQL("orders", "orders_archive", "", "id", nil, nil, nil, 987654, testTolerances())
 	if strings.Contains(sql2, "抽样种子") {
 		t.Fatal("未开启抽样不应标注种子")
 	}
@@ -103,7 +111,7 @@ func TestReviewSQLRecordsSampleSeed(t *testing.T) {
 func TestBuildSampleReviewSQL(t *testing.T) {
 	rounds := [][]int64{{11, 22}, {33}}
 	results := []ReviewItemResult{{Label: "抽样第1轮逐字段比对（2行）", Verdict: "通过", Detail: "2 行全部字段一致"}}
-	sql := BuildSampleReviewSQL("orders", "orders_archive", "created_at < '2024-01-01'", "id", results, rounds, 4242, 0.0001, 0.00001)
+	sql := BuildSampleReviewSQL("orders", "orders_archive", "created_at < '2024-01-01'", "id", results, rounds, 4242, testTolerances())
 	for _, want := range []string{"独立抽样核对复查 SQL", "抽样种子: 4242", "[通过] 抽样第1轮", "第 1 轮抽中 2 行", "WHERE `id` IN (11,22)", "WHERE `id` IN (33)"} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("抽样复查 SQL 缺少 %q: %s", want, sql)

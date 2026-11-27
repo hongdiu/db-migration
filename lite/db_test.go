@@ -52,7 +52,7 @@ func TestCompareTableStructure(t *testing.T) {
 		{Name: "id", DataType: "bigint", ColumnType: "bigint unsigned"},
 		{Name: "amount", DataType: "decimal", ColumnType: "decimal(18,2)"},
 	}
-	if err := CompareTableStructure("orders", "orders_archive", src, src); err != nil {
+	if err := CompareTableStructure("orders", "orders_archive", src, src, nil, nil); err != nil {
 		t.Fatalf("完全一致应通过: %v", err)
 	}
 	// 列类型只差长度：必须拦住，这类差异写入时会被静默截断。
@@ -60,25 +60,49 @@ func TestCompareTableStructure(t *testing.T) {
 		{Name: "id", DataType: "bigint", ColumnType: "bigint unsigned"},
 		{Name: "amount", DataType: "decimal", ColumnType: "decimal(10,2)"},
 	}
-	if err := CompareTableStructure("orders", "orders_archive", src, short); err == nil {
+	if err := CompareTableStructure("orders", "orders_archive", src, short, nil, nil); err == nil {
 		t.Fatal("列精度不一致应拒绝")
 	} else if !strings.Contains(err.Error(), "decimal(10,2)") {
 		t.Fatalf("错误信息应指出具体类型差异: %v", err)
 	}
 	// 列数不一致。
-	if err := CompareTableStructure("orders", "orders_archive", src, src[:1]); err == nil {
+	if err := CompareTableStructure("orders", "orders_archive", src, src[:1], nil, nil); err == nil {
 		t.Fatal("列数不一致应拒绝")
 	}
 	// 列顺序不同：INSERT 按列名写入本身不受影响，但说明不是源表副本，按结构不符处理。
 	swapped := []ColumnMeta{src[1], src[0]}
-	if err := CompareTableStructure("orders", "orders_archive", src, swapped); err == nil {
+	if err := CompareTableStructure("orders", "orders_archive", src, swapped, nil, nil); err == nil {
 		t.Fatal("列顺序不一致应拒绝")
 	}
 	// 只有 DataType（没有 ColumnType）时退化为按基础类型比对。
 	plain := []ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "amount", DataType: "decimal"}}
 	plainOther := []ColumnMeta{{Name: "id", DataType: "bigint"}, {Name: "amount", DataType: "int"}}
-	if err := CompareTableStructure("a", "ah", plain, plainOther); err == nil {
+	if err := CompareTableStructure("a", "ah", plain, plainOther, nil, nil); err == nil {
 		t.Fatal("基础类型不一致应拒绝")
+	}
+}
+
+func TestCompareTableStructureIndexes(t *testing.T) {
+	cols := []ColumnMeta{{Name: "id"}, {Name: "order_no"}}
+	// 索引名不同但结构相同：跨表索引名可以不同，不应误报。
+	srcIdx := []IndexMeta{{Name: "PRIMARY", Unique: true, Columns: []string{"id"}},
+		{Name: "uk_order", Unique: true, Columns: []string{"order_no"}}}
+	dstIdx := []IndexMeta{{Name: "PRIMARY", Unique: true, Columns: []string{"id"}},
+		{Name: "uk_no", Unique: true, Columns: []string{"order_no"}}}
+	if err := CompareTableStructure("a", "ah", cols, cols, srcIdx, dstIdx); err != nil {
+		t.Fatalf("索引结构一致时不应因名字不同报错: %v", err)
+	}
+	// 归档表缺唯一索引：写入不再按该唯一键去重，必须拦住。
+	if err := CompareTableStructure("a", "ah", cols, cols, srcIdx, dstIdx[:1]); err == nil {
+		t.Fatal("缺少唯一索引应拒绝")
+	} else if !strings.Contains(err.Error(), "索引不一致") {
+		t.Fatalf("错误信息应点明索引差异: %v", err)
+	}
+	// 唯一性不同（唯一 vs 普通）也要拦。
+	nonUnique := []IndexMeta{{Name: "PRIMARY", Unique: true, Columns: []string{"id"}},
+		{Name: "uk_no", Unique: false, Columns: []string{"order_no"}}}
+	if err := CompareTableStructure("a", "ah", cols, cols, srcIdx, nonUnique); err == nil {
+		t.Fatal("唯一性不同应拒绝")
 	}
 }
 

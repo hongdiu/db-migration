@@ -56,7 +56,7 @@ func run() error {
 	action := flag.String("action", "", "动作：migrate | verify | sample | purge")
 	onlyTable := flag.String("table", "", "只处理指定表（可选，默认处理配置里的全部表）")
 	seed := flag.Int64("seed", -1, "抽样种子（verify/sample/purge 通用）：不指定则每次取当前时间戳，指定则固定便于复现")
-	force := flag.Bool("force", false, "放行默认被拒绝的危险操作（全表模式源表带触发器/外键、purge 关闭抽样）；仅在明确知情时使用")
+	force := flag.Bool("force", false, "放行默认被拒绝的危险操作（全表模式源表带触发器/外键/非主键自增列、purge 关闭抽样）；仅在明确知情时使用")
 	flag.Parse()
 
 	if *action != "migrate" && *action != "verify" && *action != "sample" && *action != "purge" {
@@ -88,6 +88,11 @@ func run() error {
 			// 模式与动作不匹配不算失败：一个配置里常混着全表归档和条件迁移两类表，
 			// 跑 verify 时全表模式那几张跳过即可，不能让整批处理中断。
 			if errors.Is(err, errActionNotApplicable) {
+				// 显式 -table 指定了这张表却给了不适用的动作，属于操作失误：
+				// 必须报错退出，不能像批量模式那样静默跳过并返回 0。
+				if *onlyTable != "" {
+					return fmt.Errorf("表 %s 处理失败: %w", t.Name, err)
+				}
 				fmt.Printf("跳过: %v\n\n", err)
 				skipped++
 				continue
@@ -164,7 +169,15 @@ func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, act
 				if err != nil {
 					return err
 				}
-				if err := CompareTableStructure(t.Name, t.ArchiveTable, srcCols, arcCols); err != nil {
+				srcIdx, err := tableIndexes(ctx, db, t.Name)
+				if err != nil {
+					return err
+				}
+				arcIdx, err := tableIndexes(ctx, db, t.ArchiveTable)
+				if err != nil {
+					return err
+				}
+				if err := CompareTableStructure(t.Name, t.ArchiveTable, srcCols, arcCols, srcIdx, arcIdx); err != nil {
 					return err
 				}
 				fmt.Printf("归档表 %s 已存在，结构校验通过，按已有进度继续。\n", t.ArchiveTable)

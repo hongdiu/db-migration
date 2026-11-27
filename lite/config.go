@@ -65,10 +65,15 @@ type VerifyCfg struct {
 	// 若严格按 BlockSize 切块会产生天文数字个分块，直接把进程撑爆。
 	// 超过上限时自动放大块宽，宁可定位精度变粗也不让校验跑不起来。
 	BlockCountMax int `yaml:"block_count_max"`
-	// AbsTolerance 浮点绝对容差，默认 0.0001。
+	// AbsTolerance FLOAT 的绝对容差，默认 0.0001。
 	AbsTolerance float64 `yaml:"abs_tolerance"`
-	// RelTolerance 浮点相对容差，默认 0.00001。
+	// RelTolerance FLOAT 的相对容差，默认 0.00001。
 	RelTolerance float64 `yaml:"rel_tolerance"`
+	// DoubleAbsTolerance DOUBLE 的绝对容差，默认 1e-9。
+	// DOUBLE 的有效数字比 FLOAT 多一倍以上，用 FLOAT 那组阈值会把它的真实差异放过。
+	DoubleAbsTolerance float64 `yaml:"double_abs_tolerance"`
+	// DoubleRelTolerance DOUBLE 的相对容差，默认 1e-12。
+	DoubleRelTolerance float64 `yaml:"double_rel_tolerance"`
 	// SampleRounds 抽样轮数，默认 3；设为 0 关闭抽样。
 	// 用指针区分"未配置"和"显式配 0"，避免默认值覆盖关闭意图。
 	SampleRounds *int `yaml:"sample_rounds"`
@@ -95,6 +100,15 @@ func (v VerifyCfg) PerRound() int {
 // SampleEnabled 是否开启抽样。
 func (v VerifyCfg) SampleEnabled() bool {
 	return v.Rounds() > 0 && v.PerRound() > 0
+}
+
+// Tolerances 返回两类浮点各自使用的比对阈值。
+// 配置里分开存，跑校验时由字段类型自动取对应的一组。
+func (v VerifyCfg) Tolerances() Tolerances {
+	return Tolerances{
+		Float:  Tolerance{Abs: v.AbsTolerance, Rel: v.RelTolerance},
+		Double: Tolerance{Abs: v.DoubleAbsTolerance, Rel: v.DoubleRelTolerance},
+	}
 }
 
 // LoadConfig 读取并校验配置文件。
@@ -148,6 +162,14 @@ func (c *Config) applyDefaults() error {
 		}
 		if t.Verify.RelTolerance == 0 {
 			t.Verify.RelTolerance = 0.00001
+		}
+		// DOUBLE 的默认阈值比 FLOAT 严一到两个数量级：1e-9 / 1e-12。
+		// 与 README 的说明保持一致，不再是"文档写了、代码没有"。
+		if t.Verify.DoubleAbsTolerance == 0 {
+			t.Verify.DoubleAbsTolerance = 1e-9
+		}
+		if t.Verify.DoubleRelTolerance == 0 {
+			t.Verify.DoubleRelTolerance = 1e-12
 		}
 		// 抽样参数：未配置时用方法里的默认值；这里只把显式配置值校验到合法范围。
 		rounds := t.Verify.Rounds()

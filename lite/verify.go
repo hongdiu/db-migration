@@ -1,4 +1,4 @@
-// 校验引擎：记录数、主键分块计数、数值列求和与最值。
+// 校验引擎：记录数、主键分块计数、数值列求和/最值/非空数。
 //
 // 设计原则：
 //   - 校验对象是"每个分块两侧是否对齐"，不是"总数差不多"。总数相等但分块对不上，说明迁错了行。
@@ -94,16 +94,35 @@ func JudgeCounts(label string, srcCount, dstCount int64, block BlockRange) Check
 }
 
 // JudgeNumericAggregate 按字段类型判定一个聚合值（求和或最值）。
-func JudgeNumericAggregate(label string, src, dst string, kind NumericKind, absTol, relTol float64, nullable bool) CheckResult {
+func JudgeNumericAggregate(label string, src, dst string, kind NumericKind, tols Tolerances, nullable bool) CheckResult {
 	r := CheckResult{Label: label}
 	// 从数据库读出的 NULL 用 sql.NullString 语义识别：这里约定空表示 NULL 由调用方传入 IsNull。
 	sv, dv := TextValue(src), TextValue(dst)
-	ok, detail := CompareNumbers(sv, dv, kind, absTol, relTol)
+	ok, detail := CompareNumbers(sv, dv, kind, tols)
 	r.Pass = ok
 	r.Detail = detail
 	if nullable {
 		r.Detail += "（该列可空，NULL 已按独立值处理）"
 	}
+	return r
+}
+
+// JudgeNonNullCounts 判定两列的非空行数是否相等（零容差）。
+// 这一项专门补 SUM/MIN/MAX 的盲区：一侧 100 行全为 0、另一侧 50 行为 0 加 50 行 NULL 时，
+// SUM、MIN、MAX 完全相等，只有非空数和逐行抽样能区分。
+func JudgeNonNullCounts(label string, src, dst NumericValue) CheckResult {
+	r := CheckResult{Label: label}
+	if src.IsNull || dst.IsNull {
+		// COUNT(col) 不会返回 NULL；出现说明调用方传错了聚合函数。
+		r.Detail = fmt.Sprintf("非空数异常：源=%s，归档=%s", nullLabel(src), nullLabel(dst))
+		return r
+	}
+	if src.Raw == dst.Raw {
+		r.Pass = true
+		r.Detail = fmt.Sprintf("两侧非空行数均为 %s", src.Raw)
+		return r
+	}
+	r.Detail = fmt.Sprintf("非空行数不等：源=%s，归档=%s（NULL 不算 0，也不能被 SUM 抵消）", src.Raw, dst.Raw)
 	return r
 }
 
@@ -123,6 +142,21 @@ func countRows(ctx context.Context, db *sql.DB, table, condition string) (int64,
 // countRowsInBlock 统计某个主键分块内的行数。
 func countRowsInBlock(ctx context.Context, db *sql.DB, table, keyCol, condition string, block BlockRange) (int64, error) {
 	where := fmt.Sprintf("%s BETWEEN %d AND %d", qIdent(keyCol), block.Lo, block.Hi)
+	if condition != "" {
+		where = "(" + condition + ") AND " + where
+	}
+	q := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", qIdent(table), where)
+	var n int64
+	if err := db.QueryRowContext(ctx, q).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// countRowsInKeyRange 统计主键落在 (lo, hi] 内、且满足条件的行数。
+// 删除意图记录的是左开右闭区间：起点是上一批已确认的终点，不能重复计入。
+func countRowsInKeyRange(ctx context.Context, db *sql.DB, table, keyCol, condition string, lo, hi int64) (int64, error) {
+	where := fmt.Sprintf("%s > %d AND %s <= %d", qIdent(keyCol), lo, qIdent(keyCol), hi)
 	if condition != "" {
 		where = "(" + condition + ") AND " + where
 	}

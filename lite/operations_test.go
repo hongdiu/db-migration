@@ -104,12 +104,13 @@ func TestAlignAutoIncrementValue(t *testing.T) {
 }
 
 func TestJudgeRenameSideEffects(t *testing.T) {
-	if err := judgeRenameSideEffects(nil, nil); err != nil {
+	if err := judgeRenameSideEffects(nil, nil, nil, ""); err != nil {
 		t.Fatalf("没有副作用应放行: %v", err)
 	}
 	err := judgeRenameSideEffects(
 		[]string{"trg_audit（AFTER INSERT）"},
 		[]DependencyInfo{{Kind: "outbound_foreign_key", Name: "fk_user", Ref: "users"}},
+		nil, "",
 	)
 	if err == nil {
 		t.Fatal("有触发器或外键应拒绝")
@@ -119,6 +120,20 @@ func TestJudgeRenameSideEffects(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("提示信息应包含 %q，实际 %s", want, msg)
 		}
+	}
+
+	// 非主键自增列：改名后新表从 1 重新发号，必须拦。
+	err = judgeRenameSideEffects(nil, nil, []string{"seq"}, "")
+	if err == nil || !strings.Contains(err.Error(), "自增列: seq") || !strings.Contains(err.Error(), "重复") {
+		t.Fatalf("非主键自增列应被拦下并说明重号风险: %v", err)
+	}
+	// 自增列就是被对齐的主键：计数器会被 ALTER 恢复，不算副作用。
+	if err := judgeRenameSideEffects(nil, nil, []string{"id"}, "id"); err != nil {
+		t.Fatalf("被对齐的主键自增列不应拦: %v", err)
+	}
+	// 整型主键被对齐，但另有非主键自增列：仍然有风险。
+	if err := judgeRenameSideEffects(nil, nil, []string{"id", "seq"}, "id"); err == nil {
+		t.Fatal("主键之外的另一个自增列应被拦下")
 	}
 }
 

@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestMakeBlocks(t *testing.T) {
 	blocks := MakeBlocks(1, 10, 3)
@@ -68,25 +71,46 @@ func TestJudgeCounts(t *testing.T) {
 	}
 }
 
+func TestJudgeNonNullCounts(t *testing.T) {
+	// 正常相等。
+	r := JudgeNonNullCounts("amount 非空数", TextValue("100"), TextValue("100"))
+	if !r.Pass || !strings.Contains(r.Detail, "100") {
+		t.Fatalf("非空数相等应通过: %+v", r)
+	}
+	// 一侧 50 行 NULL、另一侧没有 NULL：SUM 可能相等，非空数必须判失败。
+	r = JudgeNonNullCounts("amount 非空数", TextValue("100"), TextValue("50"))
+	if r.Pass {
+		t.Fatal("非空行数不等应判失败")
+	}
+	if !strings.Contains(r.Detail, "NULL 不算 0") {
+		t.Fatalf("失败说明应点明 NULL 语义: %s", r.Detail)
+	}
+	// COUNT(col) 不会返回 NULL；万一传进来要报异常而不是误判通过。
+	r = JudgeNonNullCounts("amount 非空数", NullValue(), TextValue("0"))
+	if r.Pass || !strings.Contains(r.Detail, "异常") {
+		t.Fatalf("NULL 输入应判异常: %+v", r)
+	}
+}
+
 func TestJudgeNumericAggregateByType(t *testing.T) {
 	// 整数：差 1 失败。
-	if r := JudgeNumericAggregate("求和", "100", "101", NumericInteger, 0.0001, 0.00001, false); r.Pass {
+	if r := JudgeNumericAggregate("求和", "100", "101", NumericInteger, testTolerances(), false); r.Pass {
 		t.Fatal("整数差 1 应失败")
 	}
 	// 定点小数：写法差异通过。
-	if r := JudgeNumericAggregate("求和", "1.0", "1.00", NumericDecimal, 0.0001, 0.00001, false); !r.Pass {
+	if r := JudgeNumericAggregate("求和", "1.0", "1.00", NumericDecimal, testTolerances(), false); !r.Pass {
 		t.Fatal("定点小数写法差异应通过")
 	}
 	// 浮点：容差内通过。
-	if r := JudgeNumericAggregate("求和", "1.00005", "1.0", NumericFloat, 0.0001, 0.00001, false); !r.Pass {
+	if r := JudgeNumericAggregate("求和", "1.00005", "1.0", NumericFloat, testTolerances(), false); !r.Pass {
 		t.Fatal("浮点容差内应通过")
 	}
 	// 浮点：超容差失败。
-	if r := JudgeNumericAggregate("求和", "1.001", "1.0", NumericFloat, 0.0001, 0.00001, false); r.Pass {
+	if r := JudgeNumericAggregate("求和", "1.001", "1.0", NumericFloat, testTolerances(), false); r.Pass {
 		t.Fatal("浮点超容差应失败")
 	}
 	// NULL 与 0 不等。
-	if r := JudgeNumericAggregate("求和", "", "0", NumericDecimal, 0.0001, 0.00001, true); r.Pass {
+	if r := JudgeNumericAggregate("求和", "", "0", NumericDecimal, testTolerances(), true); r.Pass {
 		t.Fatal("NULL 与 0 不应相等")
 	}
 }

@@ -185,6 +185,25 @@ func TestProbePointsReproducibleAndVarying(t *testing.T) {
 	}
 }
 
+func TestRandomOffsetBoundaryNoPanic(t *testing.T) {
+	// 回归：span 恰为 int63 最大值时，int64(span)+1 会溢出成负数，
+	// Int63n 收到非正参数直接 panic。必须走 64 位取模分支。
+	const maxInt63 = uint64(1<<63 - 1)
+	rng := rand.New(rand.NewSource(9))
+	for i := 0; i < 100; i++ {
+		v := randomOffset(maxInt63, rng)
+		if v > maxInt63 {
+			t.Fatalf("偏移量越界: %d > %d", v, uint64(maxInt63))
+		}
+	}
+	// span 为 uint64 上界时返回完整 64 位随机值，同样不能 panic。
+	_ = randomOffset(^uint64(0), rng)
+	// 小跨度仍按 Int63n 走，结果不超过 span。
+	if v := randomOffset(10, rng); v > 10 {
+		t.Fatalf("小跨度偏移越界: %d", v)
+	}
+}
+
 func TestProbePointsExtremesNoOverflow(t *testing.T) {
 	minKey := int64(-1 << 63)
 	maxKey := int64(^uint64(0) >> 1)

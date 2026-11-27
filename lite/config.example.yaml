@@ -41,11 +41,14 @@ tables:
     key_column: id                  # 留空则自动探测；条件模式要求单列整型主键
     batch_size: 5000                # 每批行数
     verify:
-      numeric_fields: [amount, fee] # 数值校验列，类型自动探测后按类型比对
+      numeric_fields: [amount, fee] # 数值校验列，类型自动探测后按类型比对。
+                                    # 留空则跳过求和/最值/非空数，结论会写明"未校验数值列"
       block_size: 100000            # 主键分块大小，用于定位差异落在哪一段
       block_count_max: 1000         # 分块数量上限；雪花 ID 等大跨度主键会把块宽自动放大
-      abs_tolerance: 0.0001         # 浮点绝对容差（整数与定点小数始终零容差）
-      rel_tolerance: 0.00001        # 浮点相对容差
+      abs_tolerance: 0.0001         # FLOAT 绝对容差（整数、定点小数始终零容差）
+      rel_tolerance: 0.00001        # FLOAT 相对容差
+      double_abs_tolerance: 1e-9    # DOUBLE 绝对容差；分精度设阈值，不沿用 FLOAT 那组
+      double_rel_tolerance: 1e-12   # DOUBLE 相对容差
       # 随机抽样逐行比对：从归档表按主键抽样，抽中行回读两张表全部字段逐字段比对。
       # 能抓出"两行数据互换"这类求和/计数发现不了的错误，用于部分数据迁移场景。
       # 主路径是"主键区间随机探针取点"，开销与样本数成正比；小表或空洞极多时降级为顺序扫描。

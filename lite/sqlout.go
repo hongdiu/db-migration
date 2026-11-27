@@ -39,13 +39,14 @@ func sampleSeedNote(sampleRounds [][]int64, seed int64) string {
 
 // BuildReviewSQL 生成完整的复查 SQL 文本。
 // sampleRounds 是逐轮抽中的主键清单；传 nil 表示未开启抽样，不输出抽样小节。
-func BuildReviewSQL(sourceTable, archiveTable, condition, keyCol string, fields []ReviewField, results []ReviewItemResult, sampleRounds [][]int64, seed int64, absTol, relTol float64) string {
-	return BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, "", keyCol, fields, results, sampleRounds, seed, absTol, relTol)
+// tols 按字段类型提供 FLOAT / DOUBLE 各自的容差。
+func BuildReviewSQL(sourceTable, archiveTable, condition, keyCol string, fields []ReviewField, results []ReviewItemResult, sampleRounds [][]int64, seed int64, tols Tolerances) string {
+	return BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, "", keyCol, fields, results, sampleRounds, seed, tols)
 }
 
 // BuildReviewSQLWithArchiveCondition 在附加归档表过滤条件下生成复查 SQL。
 // 删除续跑时传入"主键 > 上次删除位置"，让人工复查看到的范围与工具校验一致。
-func BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, archiveCondition, keyCol string, fields []ReviewField, results []ReviewItemResult, sampleRounds [][]int64, seed int64, absTol, relTol float64) string {
+func BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, archiveCondition, keyCol string, fields []ReviewField, results []ReviewItemResult, sampleRounds [][]int64, seed int64, tols Tolerances) string {
 	var sb strings.Builder
 	sb.WriteString("-- 数据迁移复查 SQL\n")
 	sb.WriteString(fmt.Sprintf("-- 生成时间: %s\n", time.Now().Format("2006-01-02 15:04:05")))
@@ -79,7 +80,7 @@ func BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, ar
 	// 核对项二：按字段类型的求和比对。
 	sb.WriteString("-- ========== 核对项 2：数值列求和（按字段类型分别判定） ==========\n")
 	for _, f := range fields {
-		sb.WriteString(buildFieldReview(f, sourceTable, archiveTable, srcWhere, archiveWhere, absTol, relTol))
+		sb.WriteString(buildFieldReview(f, sourceTable, archiveTable, srcWhere, archiveWhere, tols))
 		sb.WriteString("\n")
 	}
 
@@ -116,7 +117,7 @@ func BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, ar
 
 // BuildSampleReviewSQL 生成独立抽样动作的复查 SQL：只含抽样小节，不夹带记录数/求和等项。
 // 头部标注种子，抽中的主键附两表回读语句，便于人工对照和复现。
-func BuildSampleReviewSQL(sourceTable, archiveTable, condition, keyCol string, results []ReviewItemResult, sampleRounds [][]int64, seed int64, absTol, relTol float64) string {
+func BuildSampleReviewSQL(sourceTable, archiveTable, condition, keyCol string, results []ReviewItemResult, sampleRounds [][]int64, seed int64, tols Tolerances) string {
 	var sb strings.Builder
 	sb.WriteString("-- 独立抽样核对复查 SQL\n")
 	sb.WriteString(fmt.Sprintf("-- 生成时间: %s\n", time.Now().Format("2006-01-02 15:04:05")))
@@ -151,7 +152,7 @@ func BuildSampleReviewSQL(sourceTable, archiveTable, condition, keyCol string, r
 }
 
 // buildFieldReview 按字段类型生成对应的复查 SQL。
-func buildFieldReview(f ReviewField, sourceTable, archiveTable, srcWhere, archiveWhere string, absTol, relTol float64) string {
+func buildFieldReview(f ReviewField, sourceTable, archiveTable, srcWhere, archiveWhere string, tols Tolerances) string {
 	sumExpr := fmt.Sprintf("SUM(%s)", qIdent(f.Name))
 	switch f.Kind {
 	case NumericInteger:
@@ -164,17 +165,18 @@ func buildFieldReview(f ReviewField, sourceTable, archiveTable, srcWhere, archiv
 			"SELECT %s AS 源表求和 FROM %s%s;\n"+
 			"SELECT %s AS 归档表求和 FROM %s%s;\n",
 			f.Name, sumExpr, qIdent(sourceTable), srcWhere, sumExpr, qIdent(archiveTable), archiveWhere)
-	case NumericFloat:
-		return fmt.Sprintf("-- 字段 %s [浮点] —— 容差判定：差值绝对值 <= %g + %g × 较大绝对值\n"+
+	case NumericFloat, NumericDouble:
+		tol := tols.For(f.Kind)
+		return fmt.Sprintf("-- 字段 %s [%s] —— 容差判定：差值绝对值 <= %g + %g × 较大绝对值\n"+
 			"SET @src_sum = (SELECT %s FROM %s%s);\n"+
 			"SET @dst_sum = (SELECT %s FROM %s%s);\n"+
 			"SELECT @src_sum AS 源表求和, @dst_sum AS 归档表求和,\n"+
 			"       ABS(@src_sum - @dst_sum) <= %g + %g * GREATEST(ABS(@src_sum), ABS(@dst_sum)) AS 是否在容差内;\n"+
 			"-- 返回 1 = 通过，0 = 不通过\n",
-			f.Name, absTol, relTol,
+			f.Name, f.Kind, tol.Abs, tol.Rel,
 			sumExpr, qIdent(sourceTable), srcWhere,
 			sumExpr, qIdent(archiveTable), archiveWhere,
-			absTol, relTol)
+			tol.Abs, tol.Rel)
 	default:
 		return fmt.Sprintf("-- 字段 %s [%s] —— 非数值列，不生成求和比对\n", f.Name, f.Kind)
 	}
