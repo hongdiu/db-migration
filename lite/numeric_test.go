@@ -4,15 +4,15 @@ import "testing"
 
 func TestNumericKindFromDBType(t *testing.T) {
 	cases := map[string]NumericKind{
-		"bigint":    NumericInteger,
-		"INT":       NumericInteger,
-		"tinyint":   NumericInteger,
-		"decimal":   NumericDecimal,
-		"NUMERIC":   NumericDecimal,
-		"double":    NumericFloat,
-		"FLOAT":     NumericFloat,
-		"varchar":   NumericNone,
-		"datetime":  NumericNone,
+		"bigint":   NumericInteger,
+		"INT":      NumericInteger,
+		"tinyint":  NumericInteger,
+		"decimal":  NumericDecimal,
+		"NUMERIC":  NumericDecimal,
+		"double":   NumericFloat,
+		"FLOAT":    NumericFloat,
+		"varchar":  NumericNone,
+		"datetime": NumericNone,
 	}
 	for typ, want := range cases {
 		if got := NumericKindFromDBType(typ); got != want {

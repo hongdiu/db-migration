@@ -7,11 +7,12 @@
 //   - purge  ：删除源数据，内部强制先校验，通过后才按已校验主键清单分批删。
 //
 // 用法：
-//   dbmigration-lite -config config.yaml -action migrate
-//   dbmigration-lite -config config.yaml -action verify
-//   dbmigration-lite -config config.yaml -action sample
-//   dbmigration-lite -config config.yaml -action sample -seed 12345   # 指定种子便于复现
-//   dbmigration-lite -config config.yaml -action purge
+//
+//	dbmigration-lite -config config.yaml -action migrate
+//	dbmigration-lite -config config.yaml -action verify
+//	dbmigration-lite -config config.yaml -action sample
+//	dbmigration-lite -config config.yaml -action sample -seed 12345   # 指定种子便于复现
+//	dbmigration-lite -config config.yaml -action purge
 package main
 
 import (
@@ -143,29 +144,29 @@ func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, act
 			if err != nil {
 				return err
 			}
-		if err := JudgeCheckpointResumable(cp, ConfigFingerprint(*t)); err != nil {
-			return err
-		}
-		// 命中总数提前到搬运前查一次：既作为进度条分母，也用于结尾核对，
-		// 避免为了显示进度额外多查一次大表。
-		srcCount, err := countRows(ctx, db, t.Name, t.Condition)
-		if err != nil {
-			return fmt.Errorf("统计源表命中行数失败: %w", err)
-		}
-		fmt.Printf("表 %s 开始搬运：命中 %d 行，每批 %d 行。\n", t.Name, srcCount, t.BatchSize)
-		if err := RunCopy(ctx, db, cfg, t, keyCol, columns, cp, srcCount); err != nil {
-			return err
-		}
-		// 循环退出只代表游标走到头，必须立刻核对行数，避免把漏搬当成搬运完成。
-		archiveCount, err := countRows(ctx, db, t.ArchiveTable, "")
-		if err != nil {
-			return fmt.Errorf("核对归档表行数失败: %w", err)
-		}
-		if err := JudgeCopyCounts(srcCount, archiveCount); err != nil {
-			return err
-		}
-		fmt.Printf("表 %s 搬运完成（源表命中 %d 行，归档表 %d 行），请执行 -action verify 复核。\n", t.Name, srcCount, archiveCount)
-		return nil
+			if err := JudgeCheckpointResumable(cp, ConfigFingerprint(*t)); err != nil {
+				return err
+			}
+			// 命中总数提前到搬运前查一次：既作为进度条分母，也用于结尾核对，
+			// 避免为了显示进度额外多查一次大表。
+			srcCount, err := countRows(ctx, db, t.Name, t.Condition)
+			if err != nil {
+				return fmt.Errorf("统计源表命中行数失败: %w", err)
+			}
+			fmt.Printf("表 %s 开始搬运：命中 %d 行，每批 %d 行。\n", t.Name, srcCount, t.BatchSize)
+			if err := RunCopy(ctx, db, cfg, t, keyCol, columns, cp, srcCount); err != nil {
+				return err
+			}
+			// 循环退出只代表游标走到头，必须立刻核对行数，避免把漏搬当成搬运完成。
+			archiveCount, err := countRows(ctx, db, t.ArchiveTable, "")
+			if err != nil {
+				return fmt.Errorf("核对归档表行数失败: %w", err)
+			}
+			if err := JudgeCopyCounts(srcCount, archiveCount); err != nil {
+				return err
+			}
+			fmt.Printf("表 %s 搬运完成（源表命中 %d 行，归档表 %d 行），请执行 -action verify 复核。\n", t.Name, srcCount, archiveCount)
+			return nil
 		case "verify":
 			return DoVerify(ctx, db, cfg, t, sampleSeed)
 		case "sample":

@@ -1,8 +1,10 @@
 // 抽样：从归档表取少量主键，用于逐字段比对。
 //
-// 主路径是"分区取点"：把主键范围切成若干等宽区间（数量是样本数的 3 倍，用于对抗主键空洞），
-// 每个区间只在数据库里查一条，拿到候选后洗牌取所需数量。全程不把全部主键读到程序里，
-// 几千万行的表也只返回几百行，避免原先把几千万个主键逐行传输到客户端的开销。
+// 主路径是"分区随机探针"：把主键范围切成若干等宽区间（数量是样本数的 3 倍，用于对抗主键空洞），
+// 每个区间先由种子生成一个随机探针点，再在数据库里取离探针最近的一条候选（先向后找、找不到再向前找），
+// 拿到候选后洗牌取所需数量。探针由种子决定，换种子就换一批候选，
+// 反复执行 sample 才能真正扩大抽查面（早先每区间取最小主键时，候选集是固定的，换种子只在同一批里换）。
+// 全程不把全部主键读到程序里，几千万行的表也只返回几百行，避免把几千万个主键逐行传输到客户端的开销。
 //
 // 降级路径是"蓄水池抽样"：候选不足时（表很小或主键空洞极多）改回原来的流式全扫描。
 // 蓄水池对每一行等概率，不会因主键空洞整段漏抽，适合小表。
@@ -60,6 +62,41 @@ func MakeSampleRanges(minKey, maxKey int64, count int) []BlockRange {
 		ranges[len(ranges)-1].Hi = maxKey
 	}
 	return ranges
+}
+
+// ProbePoints 为每个区间生成一个随机探针点，供"取离探针最近的候选"使用。
+// 探针在 [Lo,Hi] 内按跨度均匀分布，主键有空洞也不会越界。
+// 同一 seed 得到完全相同的探针，因此 -seed 能复现整轮抽样；不同 seed 探针不同，候选随之改变。
+func ProbePoints(ranges []BlockRange, rng *rand.Rand) []int64 {
+	points := make([]int64, len(ranges))
+	for i, r := range ranges {
+		points[i] = randomPointIn(r, rng)
+	}
+	return points
+}
+
+// randomPointIn 在区间内均匀取一个点。用无符号运算算跨度，避免两端极值相减溢出。
+func randomPointIn(r BlockRange, rng *rand.Rand) int64 {
+	span := uint64(r.Hi) - uint64(r.Lo)
+	return int64(uint64(r.Lo) + randomOffset(span, rng))
+}
+
+// randomOffset 返回 [0, span] 内均匀分布的偏移量。
+// 区间可能跨过 0 一直到正负极值（跨度接近 2^64），装不进 int63，因此分两种情况取随机数。
+func randomOffset(span uint64, rng *rand.Rand) uint64 {
+	if span == 0 {
+		return 0
+	}
+	const maxInt63 = uint64(1<<63 - 1)
+	if span <= maxInt63 {
+		return uint64(rng.Int63n(int64(span) + 1))
+	}
+	// 跨度超过 int63 能表示的范围：拼两个 63 位随机数得到 64 位随机值。
+	v := uint64(rng.Int63())<<1 | uint64(rng.Int63()&1)
+	if span == ^uint64(0) {
+		return v
+	}
+	return v % (span + 1)
 }
 
 // PickSampleCandidates 从候选主键中随机选出 needed 个。
@@ -150,7 +187,7 @@ func SampleKeysWithCondition(ctx context.Context, db *sql.DB, table, keyCol, con
 		return nil, fmt.Errorf("读取归档表主键范围失败: %w", err)
 	}
 
-	// 第二步：每个区间只取一条候选。冗余系数 3 用于对抗主键空洞。
+	// 第二步：每个区间用随机探针取一条最近的候选。冗余系数 3 用于对抗主键空洞。
 	var candidates []int64
 	if lo.Valid && hi.Valid {
 		// 区间数最多 10000（配置里单轮上限 10000 × 轮数上限 100 × 3 会过大，这里封顶）。
@@ -158,19 +195,15 @@ func SampleKeysWithCondition(ctx context.Context, db *sql.DB, table, keyCol, con
 		if rangeCount > 10000 {
 			rangeCount = 10000
 		}
-		for _, r := range MakeSampleRanges(lo.Int64, hi.Int64, rangeCount) {
-			extra := fmt.Sprintf("%s BETWEEN %d AND %d", qIdent(keyCol), r.Lo, r.Hi)
-			clause := extra
-			if condition != "" {
-				clause = "(" + condition + ") AND " + extra
+		ranges := MakeSampleRanges(lo.Int64, hi.Int64, rangeCount)
+		probes := ProbePoints(ranges, rng)
+		for i, r := range ranges {
+			k, found, err := pickKeyNearProbe(ctx, db, table, keyCol, condition, r, probes[i])
+			if err != nil {
+				return nil, err
 			}
-			q := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT 1",
-				qIdent(keyCol), qIdent(table), clause, qIdent(keyCol))
-			var k int64
-			if err := db.QueryRowContext(ctx, q).Scan(&k); err == nil {
+			if found {
 				candidates = append(candidates, k)
-			} else if err != sql.ErrNoRows {
-				return nil, fmt.Errorf("分区取点失败（区间 [%d,%d]）: %w", r.Lo, r.Hi, err)
 			}
 		}
 	}
@@ -181,6 +214,47 @@ func SampleKeysWithCondition(ctx context.Context, db *sql.DB, table, keyCol, con
 	}
 	// 候选不足：小表或空洞极多，降级为原来的流式蓄水池扫描。
 	return sampleKeysByScan(ctx, db, table, keyCol, where, rounds, size, rng)
+}
+
+// pickKeyNearProbe 在区间内取离探针最近的一条主键：先向后找（>= 探针），
+// 探针落在区间最后一个键之后时再向前回退一次。这样只要区间内有数据就一定取到候选，
+// 取到哪一条由探针决定，换种子就换候选。
+func pickKeyNearProbe(ctx context.Context, db *sql.DB, table, keyCol, condition string, r BlockRange, probe int64) (int64, bool, error) {
+	where := keyRangeWhere(keyCol, condition, probe, r.Hi)
+	q := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT 1",
+		qIdent(keyCol), qIdent(table), where, qIdent(keyCol))
+	var k int64
+	err := db.QueryRowContext(ctx, q).Scan(&k)
+	if err == nil {
+		return k, true, nil
+	}
+	if err != sql.ErrNoRows {
+		return 0, false, fmt.Errorf("分区取点失败（区间 [%d,%d]，探针 %d）: %w", r.Lo, r.Hi, probe, err)
+	}
+	if probe <= r.Lo {
+		return 0, false, nil
+	}
+	// 向后没有数据：向前回退，取区间内小于探针的最后一个键。
+	backWhere := keyRangeWhere(keyCol, condition, r.Lo, probe-1)
+	back := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s DESC LIMIT 1",
+		qIdent(keyCol), qIdent(table), backWhere, qIdent(keyCol))
+	err = db.QueryRowContext(ctx, back).Scan(&k)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("分区取点失败（区间 [%d,%d]，探针 %d）: %w", r.Lo, r.Hi, probe, err)
+	}
+	return k, true, nil
+}
+
+// keyRangeWhere 拼出"主键落在 [lo,hi] 且满足迁移条件"的 WHERE 片段。
+func keyRangeWhere(keyCol, condition string, lo, hi int64) string {
+	clause := fmt.Sprintf("%s BETWEEN %d AND %d", qIdent(keyCol), lo, hi)
+	if condition != "" {
+		clause = "(" + condition + ") AND " + clause
+	}
+	return clause
 }
 
 // sampleKeysByScan 是原全量流式扫描，仅在分区取点候选不足时使用。

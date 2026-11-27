@@ -116,7 +116,12 @@ func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey, seed
 		return nil, fmt.Errorf("读取归档表主键范围失败: %w", err)
 	}
 	if lo.Valid && hi.Valid {
-		for _, block := range MakeBlocks(lo.Int64, hi.Int64, t.Verify.BlockSize) {
+		blockSize := FitBlockSize(lo.Int64, hi.Int64, t.Verify.BlockSize, t.Verify.BlockCountMax)
+		if blockSize != t.Verify.BlockSize {
+			fmt.Printf("表 %s 主键跨度较大，分块大小由 %d 放大到 %d（分块数上限 %d），差异定位精度相应变粗。\n",
+				t.Name, t.Verify.BlockSize, blockSize, t.Verify.BlockCountMax)
+		}
+		for _, block := range MakeBlocks(lo.Int64, hi.Int64, blockSize) {
 			sc, err := countRowsInBlock(ctx, db, t.Name, keyCol, t.Condition, block)
 			if err != nil {
 				return nil, err

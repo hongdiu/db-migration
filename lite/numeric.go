@@ -18,9 +18,9 @@ type NumericKind int
 
 const (
 	NumericNone    NumericKind = iota // 非数值列，不参与数值比对
-	NumericInteger                     // 整数：TINYINT ~ BIGINT，含无符号
-	NumericDecimal                     // 定点小数：DECIMAL / NUMERIC
-	NumericFloat                       // 浮点：FLOAT / DOUBLE
+	NumericInteger                    // 整数：TINYINT ~ BIGINT，含无符号
+	NumericDecimal                    // 定点小数：DECIMAL / NUMERIC
+	NumericFloat                      // 浮点：FLOAT / DOUBLE
 )
 
 func (k NumericKind) String() string {

@@ -23,9 +23,9 @@ type ReviewField struct {
 
 // ReviewItemResult 是工具对某个核对项的判定结果，写进 SQL 注释供对照。
 type ReviewItemResult struct {
-	Label  string // 核对项名称
+	Label   string // 核对项名称
 	Verdict string // 通过 / 不通过
-	Detail string // 判定说明
+	Detail  string // 判定说明
 }
 
 // sampleSeedNote 生成抽样种子说明行；未开启抽样时不输出。

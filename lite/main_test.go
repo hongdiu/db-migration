@@ -16,9 +16,9 @@ func TestSampleSeedNotice(t *testing.T) {
 
 func TestResolveSampleSeed(t *testing.T) {
 	cases := []struct {
-		name               string
-		requested, auto    int64
-		want               int64
+		name            string
+		requested, auto int64
+		want            int64
 	}{
 		{"未指定用自动种子", -1, 1700000000123456789, 1700000000123456789},
 		{"指定种子原样返回", 12345, 1700000000123456789, 12345},

@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -47,6 +48,37 @@ func MakeBlocks(minKey, maxKey, blockSize int64) []BlockRange {
 		lo = hi + 1
 	}
 	return blocks
+}
+
+// FitBlockSize 把分块大小调整到"分块数不超过 maxBlocks"，返回实际应使用的块宽。
+// 主键跨度与分块数的关系是纯算术，放在这里便于单测：雪花 ID 这类跨度 1e18 的主键，
+// 按固定 10 万切块会得到 1e13 个分块，任何机器都撑不住；此时放大块宽，宁可定位精度变粗。
+// 返回原 blockSize 表示无需调整。
+func FitBlockSize(minKey, maxKey, blockSize int64, maxBlocks int) int64 {
+	if blockSize <= 0 || maxBlocks <= 0 || minKey >= maxKey {
+		return blockSize
+	}
+	span := uint64(maxKey) - uint64(minKey) // 区间内键值个数 = span + 1
+	// span/blockSize + 1 恒等于 ceil((span+1)/blockSize)，即按该块宽切出来的分块数。
+	if span/uint64(blockSize)+1 <= uint64(maxBlocks) {
+		return blockSize
+	}
+	count := span
+	if count != ^uint64(0) {
+		count = span + 1
+	}
+	per := count / uint64(maxBlocks)
+	if count%uint64(maxBlocks) != 0 {
+		per++
+	}
+	if per == 0 {
+		per = 1
+	}
+	if per > uint64(math.MaxInt64) {
+		// 极端情况（整段 int64 只切一块）：返回最大块宽，仍会让块数控制在个位数。
+		return math.MaxInt64
+	}
+	return int64(per)
 }
 
 // JudgeCounts 判定两个计数是否相等（记录数和分块计数都是零容差）。

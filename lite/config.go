@@ -26,10 +26,10 @@ const (
 var identRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type Config struct {
-	Database   DBConfig       `yaml:"database"`
-	Output     OutputConfig   `yaml:"output"`
-	Checkpoint CheckpointCfg  `yaml:"checkpoint"`
-	Tables     []TableCfg     `yaml:"tables"`
+	Database   DBConfig      `yaml:"database"`
+	Output     OutputConfig  `yaml:"output"`
+	Checkpoint CheckpointCfg `yaml:"checkpoint"`
+	Tables     []TableCfg    `yaml:"tables"`
 }
 
 type DBConfig struct {
@@ -47,13 +47,13 @@ type CheckpointCfg struct {
 }
 
 type TableCfg struct {
-	Name         string      `yaml:"name"`          // 源表名
-	Mode         string      `yaml:"mode"`          // full_table 或 conditional
-	ArchiveTable string      `yaml:"archive_table"` // 归档表名
-	Condition    string      `yaml:"condition"`     // conditional 模式的 WHERE 条件
-	KeyColumn    string      `yaml:"key_column"`    // 主键列；留空则自动探测
-	BatchSize    int         `yaml:"batch_size"`    // 每批行数
-	Verify       VerifyCfg   `yaml:"verify"`        // 数值校验字段
+	Name         string    `yaml:"name"`          // 源表名
+	Mode         string    `yaml:"mode"`          // full_table 或 conditional
+	ArchiveTable string    `yaml:"archive_table"` // 归档表名
+	Condition    string    `yaml:"condition"`     // conditional 模式的 WHERE 条件
+	KeyColumn    string    `yaml:"key_column"`    // 主键列；留空则自动探测
+	BatchSize    int       `yaml:"batch_size"`    // 每批行数
+	Verify       VerifyCfg `yaml:"verify"`        // 数值校验字段
 }
 
 type VerifyCfg struct {
@@ -61,6 +61,10 @@ type VerifyCfg struct {
 	NumericFields []string `yaml:"numeric_fields"`
 	// BlockSize 主键分块大小，用于分块计数校验，定位差异落在哪一段。
 	BlockSize int64 `yaml:"block_size"`
+	// BlockCountMax 分块数量上限。主键跨度可能极大（雪花 ID、时间戳做主键时跨度可达 1e18），
+	// 若严格按 BlockSize 切块会产生天文数字个分块，直接把进程撑爆。
+	// 超过上限时自动放大块宽，宁可定位精度变粗也不让校验跑不起来。
+	BlockCountMax int `yaml:"block_count_max"`
 	// AbsTolerance 浮点绝对容差，默认 0.0001。
 	AbsTolerance float64 `yaml:"abs_tolerance"`
 	// RelTolerance 浮点相对容差，默认 0.00001。
@@ -132,6 +136,12 @@ func (c *Config) applyDefaults() error {
 		}
 		if t.Verify.BlockSize <= 0 {
 			t.Verify.BlockSize = 100000
+		}
+		if t.Verify.BlockCountMax <= 0 {
+			t.Verify.BlockCountMax = 1000
+		}
+		if t.Verify.BlockCountMax > 100000 {
+			return fmt.Errorf("tables[%d].verify.block_count_max 不能超过 100000", i)
 		}
 		if t.Verify.AbsTolerance == 0 {
 			t.Verify.AbsTolerance = 0.0001

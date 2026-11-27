@@ -25,6 +25,35 @@ func TestMakeBlocks(t *testing.T) {
 	}
 }
 
+func TestFitBlockSize(t *testing.T) {
+	// 常规跨度、块数没超限：保持原块宽。
+	if got := FitBlockSize(1, 1000000, 100000, 1000); got != 100000 {
+		t.Fatalf("未超上限应保持原块宽，实际 %d", got)
+	}
+	// 雪花 ID 跨度 1e18：必须放大块宽，把块数压到上限内。
+	const snowSpan = int64(1_000_000_000_000_000_000)
+	bs := FitBlockSize(1, snowSpan, 100000, 1000)
+	if bs == 100000 {
+		t.Fatal("超大跨度应放大块宽")
+	}
+	blocks := MakeBlocks(1, snowSpan, bs)
+	if len(blocks) > 1000 {
+		t.Fatalf("分块数应不超过上限 1000，实际 %d（块宽 %d）", len(blocks), bs)
+	}
+	if len(blocks) == 0 || blocks[len(blocks)-1].Hi != snowSpan {
+		t.Fatalf("分块应覆盖到最大主键: %+v", blocks[len(blocks)-1])
+	}
+	// 极值区间：不能溢出、不能返回非正块宽。
+	extreme := FitBlockSize(-1<<63, 1<<63-1, 100000, 1000)
+	if extreme <= 0 {
+		t.Fatalf("极值区间块宽应为正数，实际 %d", extreme)
+	}
+	// 非法输入原样返回，由调用方按默认值处理。
+	if got := FitBlockSize(10, 5, 100, 10); got != 100 {
+		t.Fatalf("空区间应返回原块宽，实际 %d", got)
+	}
+}
+
 func TestJudgeCounts(t *testing.T) {
 	block := BlockRange{Lo: 0, Hi: 99}
 	if r := JudgeCounts("分块计数", 100, 100, block); !r.Pass {

@@ -113,10 +113,10 @@ func sampleColumns(ctx context.Context, db *sql.DB, table string) ([]string, map
 
 // SampleVerdict 是一轮抽样的比对结果汇总。
 type SampleVerdict struct {
-	Round    int
-	Pass     bool
-	Diffs    []RowDiff
-	Sampled  int // 本轮抽样行数
+	Round   int
+	Pass    bool
+	Diffs   []RowDiff
+	Sampled int // 本轮抽样行数
 }
 
 // CompareSampleRound 比对一轮抽样：逐主键回读两表全部字段并比对。

@@ -49,6 +49,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if tbl.Verify.BlockSize != 100000 {
 		t.Fatalf("block_size 默认应为 100000，实际 %d", tbl.Verify.BlockSize)
 	}
+	if tbl.Verify.BlockCountMax != 1000 {
+		t.Fatalf("block_count_max 默认应为 1000，实际 %d", tbl.Verify.BlockCountMax)
+	}
 	if tbl.Verify.AbsTolerance != 0.0001 || tbl.Verify.RelTolerance != 0.00001 {
 		t.Fatalf("容差默认值不对: %+v", tbl.Verify)
 	}

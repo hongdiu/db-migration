@@ -29,9 +29,9 @@ type Checkpoint struct {
 // PurgeProgress 从进度文件里提取删除续跑所需的起点。
 // 只有处于 purging 阶段的进度才可作为续跑依据；其他阶段一律从头开始。
 type PurgeProgress struct {
-	StartKey     int64
+	StartKey      int64
 	DeletedBefore int64
-	Resuming     bool
+	Resuming      bool
 }
 
 // JudgePurgeProgress 判断进度文件能否用于删除续跑。

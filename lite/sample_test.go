@@ -147,6 +147,61 @@ func TestMakeSampleRangesHolesAndExtremes(t *testing.T) {
 	}
 }
 
+func TestProbePointsInRange(t *testing.T) {
+	ranges := MakeSampleRanges(1, 1000, 10)
+	points := ProbePoints(ranges, rand.New(rand.NewSource(7)))
+	if len(points) != len(ranges) {
+		t.Fatalf("探针数应与区间数一致: %d != %d", len(points), len(ranges))
+	}
+	for i, p := range points {
+		if p < ranges[i].Lo || p > ranges[i].Hi {
+			t.Fatalf("第 %d 个探针 %d 超出区间 %+v", i, p, ranges[i])
+		}
+	}
+}
+
+func TestProbePointsReproducibleAndVarying(t *testing.T) {
+	ranges := MakeSampleRanges(1, 100000, 50)
+	first := ProbePoints(ranges, rand.New(rand.NewSource(12345)))
+	again := ProbePoints(ranges, rand.New(rand.NewSource(12345)))
+	if len(first) != len(again) {
+		t.Fatalf("同种子探针数量不一致: %d != %d", len(first), len(again))
+	}
+	for i := range first {
+		if first[i] != again[i] {
+			t.Fatalf("同种子应完全复现，第 %d 个不同: %d != %d", i, first[i], again[i])
+		}
+	}
+	// 不同的种子必须换一批探针，否则反复 sample 只会在同一批行里打转。
+	other := ProbePoints(ranges, rand.New(rand.NewSource(54321)))
+	diff := 0
+	for i := range first {
+		if first[i] != other[i] {
+			diff++
+		}
+	}
+	if diff == 0 {
+		t.Fatal("不同种子应产生不同探针，否则抽查面无法扩大")
+	}
+}
+
+func TestProbePointsExtremesNoOverflow(t *testing.T) {
+	minKey := int64(-1 << 63)
+	maxKey := int64(^uint64(0) >> 1)
+	// 区间跨过整个 int64 范围：跨度会溢出有符号运算，必须用无符号计算。
+	full := BlockRange{Lo: minKey, Hi: maxKey}
+	for seed := int64(0); seed < 5; seed++ {
+		p := ProbePoints([]BlockRange{full}, rand.New(rand.NewSource(seed)))[0]
+		if p < minKey || p > maxKey {
+			t.Fatalf("全范围探针越界: %d", p)
+		}
+	}
+	// 单点区间必须返回该点本身。
+	if p := ProbePoints([]BlockRange{{Lo: 42, Hi: 42}}, rand.New(rand.NewSource(1)))[0]; p != 42 {
+		t.Fatalf("单点区间探针应为 42，实际 %d", p)
+	}
+}
+
 func TestPickSampleCandidates(t *testing.T) {
 	rng := rand.New(rand.NewSource(9))
 	candidates := []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
