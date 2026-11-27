@@ -326,9 +326,22 @@ func BuildCreateEmptyTable(source, empty string) string {
 	return fmt.Sprintf("CREATE TABLE %s LIKE %s", qIdent(empty), qIdent(source))
 }
 
-// BuildAlignAutoIncrement 生成把空表自增值对齐到源表最大值的 SQL。
-func BuildAlignAutoIncrement(empty, keyCol string, maxKey int64) string {
-	return fmt.Sprintf("ALTER TABLE %s AUTO_INCREMENT = %d", qIdent(empty), maxKey+1)
+// AlignAutoIncrementValue 计算新表应设置的自增值：取"主键最大值 + 1"与"源表当前自增值"中的较大者。
+// 只按 MAX+1 对齐，在源表删过历史行时会倒退，让新表重新发放已经用过的 id。
+func AlignAutoIncrementValue(maxKey, currentAutoInc int64) int64 {
+	next := maxKey + 1
+	if currentAutoInc > next {
+		next = currentAutoInc
+	}
+	if next < 1 {
+		next = 1
+	}
+	return next
+}
+
+// BuildAlignAutoIncrement 生成把空表自增值设为 next 的 SQL。
+func BuildAlignAutoIncrement(empty, keyCol string, next int64) string {
+	return fmt.Sprintf("ALTER TABLE %s AUTO_INCREMENT = %d", qIdent(empty), next)
 }
 
 // BuildRenameTable 生成原子改名 SQL：源表→归档表，空表→源表名。
@@ -346,7 +359,8 @@ func JudgeMaxKeyForAutoIncrement(maxKey int64) error {
 }
 
 // RunFullTable 执行全表模式的预检与原子切换。
-func RunFullTable(ctx context.Context, db *sql.DB, t *TableCfg) error {
+// force 只影响"改名会让新表丢掉触发器/外键"这一类可接受副作用，其余预检照旧拒绝。
+func RunFullTable(ctx context.Context, db *sql.DB, t *TableCfg, force bool) error {
 	// 预检一：归档表不能已存在。
 	exists, err := tableExists(ctx, db, t.ArchiveTable)
 	if err != nil {
@@ -356,7 +370,7 @@ func RunFullTable(ctx context.Context, db *sql.DB, t *TableCfg) error {
 		return err
 	}
 
-	// 预检二：不能有外键或视图依赖。
+	// 预检二：别人不能引用这张表（入向外键、视图），否则改名会牵连别的对象。
 	deps, err := probeDependencies(ctx, db, t.Name)
 	if err != nil {
 		return fmt.Errorf("检查表依赖失败: %w", err)
@@ -365,14 +379,21 @@ func RunFullTable(ctx context.Context, db *sql.DB, t *TableCfg) error {
 		return err
 	}
 
-	// 探测主键（全表模式也要整型主键，用于自增值对齐）。
-	pk, err := probePrimaryKey(ctx, db, t.Name)
+	// 预检三：本表自己的触发器与外键不会被 CREATE TABLE ... LIKE 复制到新空表。
+	// 这类副作用不破坏被归档的数据，但会让业务侧静默失去审计/同步/约束，默认拒绝，-force 放行。
+	triggers, err := probeTableTriggers(ctx, db, t.Name)
 	if err != nil {
-		return err
+		return fmt.Errorf("检查触发器失败: %w", err)
 	}
-	keyCol, err := judgePrimaryKeyUsable(t.KeyColumn, pk)
+	outFKs, err := probeOutboundForeignKeys(ctx, db, t.Name)
 	if err != nil {
-		return err
+		return fmt.Errorf("检查外键失败: %w", err)
+	}
+	if sideErr := judgeRenameSideEffects(triggers, outFKs); sideErr != nil {
+		if !force {
+			return sideErr
+		}
+		fmt.Printf("警告: %v\n已按 -force 继续，改名后原表名上的新空表不含上述对象。\n", sideErr)
 	}
 
 	// 空表临时名，确保不与现有对象冲突。
@@ -385,21 +406,34 @@ func RunFullTable(ctx context.Context, db *sql.DB, t *TableCfg) error {
 		return fmt.Errorf("临时空表 %s 已存在，请先清理残留", emptyTable)
 	}
 
-	// 自增值对齐。
-	maxKey, err := maxKeyValue(ctx, db, t.Name, keyCol)
+	// 自增值对齐：只有整型单列主键才需要、也才做得了。探测不到就跳过，不阻断改名。
+	keyCol, skipReason, err := chooseAutoIncrementKey(ctx, db, t.Name, t.KeyColumn)
 	if err != nil {
-		return fmt.Errorf("读取主键最大值失败: %w", err)
-	}
-	if err := JudgeMaxKeyForAutoIncrement(maxKey); err != nil {
 		return err
 	}
 
-	// 建空表 → 对齐自增值 → 原子改名。
-	stmts := []string{
-		BuildCreateEmptyTable(t.Name, emptyTable),
-		BuildAlignAutoIncrement(emptyTable, keyCol, maxKey),
-		BuildRenameTable(t.Name, t.ArchiveTable, emptyTable),
+	// 建空表 →（可选）对齐自增值 → 原子改名。
+	stmts := []string{BuildCreateEmptyTable(t.Name, emptyTable)}
+	if keyCol == "" {
+		fmt.Printf("表 %s 跳过自增值对齐：%s；改名本身不受影响。\n", t.Name, skipReason)
+	} else {
+		maxKey, err := maxKeyValue(ctx, db, t.Name, keyCol)
+		if err != nil {
+			return fmt.Errorf("读取主键最大值失败: %w", err)
+		}
+		if err := JudgeMaxKeyForAutoIncrement(maxKey); err != nil {
+			return err
+		}
+		currentAutoInc, err := sourceAutoIncrement(ctx, db, t.Name)
+		if err != nil {
+			return fmt.Errorf("读取源表自增值失败: %w", err)
+		}
+		next := AlignAutoIncrementValue(maxKey, currentAutoInc)
+		fmt.Printf("表 %s 新表自增值将设为 %d（主键最大值 %d，源表当前自增值 %d）。\n", t.Name, next, maxKey, currentAutoInc)
+		stmts = append(stmts, BuildAlignAutoIncrement(emptyTable, keyCol, next))
 	}
+	stmts = append(stmts, BuildRenameTable(t.Name, t.ArchiveTable, emptyTable))
+
 	for _, q := range stmts {
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("执行 %q 失败: %w", q, err)

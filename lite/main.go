@@ -18,11 +18,16 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"time"
 )
+
+// errActionNotApplicable 表示该表的模式不适用当前动作（例如对全表模式跑 verify）。
+// 多表配置下遇到它只跳过这张表，不当作失败，避免一张表阻断整批处理。
+var errActionNotApplicable = errors.New("动作不适用于该表的模式")
 
 // ResolveSampleSeed 把命令行种子参数解析成实际种子。
 // requested<0 表示自动，用 auto 值（纳秒时间戳）；>=0 则用指定值，便于复现。
@@ -50,7 +55,8 @@ func run() error {
 	configPath := flag.String("config", "config.yaml", "配置文件路径")
 	action := flag.String("action", "", "动作：migrate | verify | sample | purge")
 	onlyTable := flag.String("table", "", "只处理指定表（可选，默认处理配置里的全部表）")
-	seed := flag.Int64("seed", -1, "抽样种子（仅 sample 动作）：不指定则每次取当前时间戳，指定则固定便于复现")
+	seed := flag.Int64("seed", -1, "抽样种子（verify/sample/purge 通用）：不指定则每次取当前时间戳，指定则固定便于复现")
+	force := flag.Bool("force", false, "放行默认被拒绝的危险操作（全表模式源表带触发器/外键、purge 关闭抽样）；仅在明确知情时使用")
 	flag.Parse()
 
 	if *action != "migrate" && *action != "verify" && *action != "sample" && *action != "purge" {
@@ -74,12 +80,24 @@ func run() error {
 		return fmt.Errorf("没有匹配的表（指定表名: %q）", *onlyTable)
 	}
 
+	skipped := 0
 	for i := range tables {
 		t := &tables[i]
 		fmt.Printf("=== 表 %s，模式 %s，动作 %s ===\n", t.Name, t.Mode, *action)
-		if err := processTable(ctx, db, cfg, t, *action, sampleSeed); err != nil {
+		if err := processTable(ctx, db, cfg, t, *action, sampleSeed, *force); err != nil {
+			// 模式与动作不匹配不算失败：一个配置里常混着全表归档和条件迁移两类表，
+			// 跑 verify 时全表模式那几张跳过即可，不能让整批处理中断。
+			if errors.Is(err, errActionNotApplicable) {
+				fmt.Printf("跳过: %v\n\n", err)
+				skipped++
+				continue
+			}
 			return fmt.Errorf("表 %s 处理失败: %w", t.Name, err)
 		}
+	}
+	if skipped > 0 {
+		fmt.Printf("全部完成（其中 %d 张表因模式不适用被跳过）。\n", skipped)
+		return nil
 	}
 	fmt.Println("全部完成。")
 	return nil
@@ -97,14 +115,14 @@ func selectTables(tables []TableCfg, only string) []TableCfg {
 	return nil
 }
 
-func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, action string, sampleSeed int64) error {
+func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, action string, sampleSeed int64, force bool) error {
 	switch t.Mode {
 	case ModeFullTable:
 		switch action {
 		case "migrate":
-			return RunFullTable(ctx, db, t)
+			return RunFullTable(ctx, db, t, force)
 		case "verify", "sample", "purge":
-			return fmt.Errorf("全表模式是原子改名，不需要 verify/sample/purge 动作；请用 -action migrate")
+			return fmt.Errorf("%w: 全表模式是原子改名，没有搬运和删除，不需要 verify/sample/purge；请用 -action migrate", errActionNotApplicable)
 		}
 	case ModeConditional:
 		// 校验类动作一开始就打印种子；purge 成功路径不输出复查 SQL，靠这行留下记录。
@@ -135,6 +153,21 @@ func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, act
 				if _, err := db.ExecContext(ctx, BuildCreateEmptyTable(t.Name, t.ArchiveTable)); err != nil {
 					return fmt.Errorf("创建归档表失败: %w", err)
 				}
+			} else {
+				// 复用已有归档表（中断续跑场景）：它必须是源表结构的副本，
+				// 否则写入会被数据库静默转换，校验又用同一套转换规则比对，可能一路"通过"。
+				srcCols, err := tableColumns(ctx, db, t.Name)
+				if err != nil {
+					return err
+				}
+				arcCols, err := tableColumns(ctx, db, t.ArchiveTable)
+				if err != nil {
+					return err
+				}
+				if err := CompareTableStructure(t.Name, t.ArchiveTable, srcCols, arcCols); err != nil {
+					return err
+				}
+				fmt.Printf("归档表 %s 已存在，结构校验通过，按已有进度继续。\n", t.ArchiveTable)
 			}
 			// 校验字段配置在搬运前就验证，避免跑完才发现字段不存在。
 			if _, err := buildReviewFields(ctx, db, t.Name, t.Verify.NumericFields); err != nil {
@@ -172,7 +205,7 @@ func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, act
 		case "sample":
 			return DoSample(ctx, db, cfg, t, sampleSeed)
 		case "purge":
-			return RunPurge(ctx, db, cfg, t, sampleSeed)
+			return RunPurge(ctx, db, cfg, t, sampleSeed, force)
 		}
 	}
 	return fmt.Errorf("未知的模式或动作组合: mode=%s action=%s（sample 仅支持 conditional 模式）", t.Mode, action)

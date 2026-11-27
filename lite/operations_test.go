@@ -75,7 +75,7 @@ func TestFullTableSQLBuilders(t *testing.T) {
 	if got := BuildCreateEmptyTable("orders", "orders__new_empty"); got != "CREATE TABLE `orders__new_empty` LIKE `orders`" {
 		t.Fatalf("建空表 SQL 不对: %s", got)
 	}
-	if got := BuildAlignAutoIncrement("orders__new_empty", "id", 999); got != "ALTER TABLE `orders__new_empty` AUTO_INCREMENT = 1000" {
+	if got := BuildAlignAutoIncrement("orders__new_empty", "id", 1000); got != "ALTER TABLE `orders__new_empty` AUTO_INCREMENT = 1000" {
 		t.Fatalf("自增值对齐 SQL 不对: %s", got)
 	}
 	rename := BuildRenameTable("orders", "orders_archive", "orders__new_empty")
@@ -85,6 +85,56 @@ func TestFullTableSQLBuilders(t *testing.T) {
 	// 改名必须是一条原子语句，不能用分号拆成两条。
 	if strings.Contains(rename, ";") {
 		t.Fatalf("改名必须是单条原子语句: %s", rename)
+	}
+}
+
+func TestAlignAutoIncrementValue(t *testing.T) {
+	// 源表删过历史行：MAX 追不上当前自增值，必须取当前自增值，避免重发已用过的 id。
+	if got := AlignAutoIncrementValue(500, 1000); got != 1000 {
+		t.Fatalf("应取源表当前自增值 1000，实际 %d", got)
+	}
+	// 正常追加：MAX+1 更大，取 MAX+1。
+	if got := AlignAutoIncrementValue(1000, 800); got != 1001 {
+		t.Fatalf("应取 MAX+1=1001，实际 %d", got)
+	}
+	// 空表且无自增计数器：从 1 开始。
+	if got := AlignAutoIncrementValue(0, 0); got != 1 {
+		t.Fatalf("空表应从 1 开始，实际 %d", got)
+	}
+}
+
+func TestJudgeRenameSideEffects(t *testing.T) {
+	if err := judgeRenameSideEffects(nil, nil); err != nil {
+		t.Fatalf("没有副作用应放行: %v", err)
+	}
+	err := judgeRenameSideEffects(
+		[]string{"trg_audit（AFTER INSERT）"},
+		[]DependencyInfo{{Kind: "outbound_foreign_key", Name: "fk_user", Ref: "users"}},
+	)
+	if err == nil {
+		t.Fatal("有触发器或外键应拒绝")
+	}
+	msg := err.Error()
+	for _, want := range []string{"trg_audit", "fk_user", "users", "-force"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("提示信息应包含 %q，实际 %s", want, msg)
+		}
+	}
+}
+
+func TestJudgePurgeSamplingAllowed(t *testing.T) {
+	if err := JudgePurgeSamplingAllowed(true, false); err != nil {
+		t.Fatalf("抽样开启时应允许删除: %v", err)
+	}
+	err := JudgePurgeSamplingAllowed(false, false)
+	if err == nil {
+		t.Fatal("抽样关闭且未加 -force 应拒绝删除")
+	}
+	if !strings.Contains(err.Error(), "-force") || !strings.Contains(err.Error(), "sample_rounds") {
+		t.Fatalf("拒绝信息应说明原因和出口: %s", err.Error())
+	}
+	if err := JudgePurgeSamplingAllowed(false, true); err != nil {
+		t.Fatalf("加 -force 后应允许: %v", err)
 	}
 }
 

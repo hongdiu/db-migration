@@ -1,6 +1,29 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestProcessTableSkipNotApplicable(t *testing.T) {
+	// 全表模式跑 verify：必须在碰数据库之前就返回"不适用"，且可被 errors.Is 识别。
+	err := processTable(context.Background(), nil, &Config{},
+		&TableCfg{Name: "logs", Mode: ModeFullTable, ArchiveTable: "logs_archive"}, "verify", 1, false)
+	if !errors.Is(err, errActionNotApplicable) {
+		t.Fatalf("应返回不适用错误，实际 %v", err)
+	}
+	if !strings.Contains(err.Error(), "migrate") {
+		t.Fatalf("提示应指引改用 migrate: %v", err)
+	}
+	// 条件模式的校验动作不在这个分支，不能误判成"不适用"。
+	err = processTable(context.Background(), nil, &Config{},
+		&TableCfg{Name: "orders", Mode: "unknown_mode"}, "verify", 1, false)
+	if err == nil || errors.Is(err, errActionNotApplicable) {
+		t.Fatalf("未知模式应报配置错误而非跳过，实际 %v", err)
+	}
+}
 
 func TestSampleSeedNotice(t *testing.T) {
 	notice := SampleSeedNotice("trans_label", 1700000000123456789)

@@ -1,15 +1,19 @@
 # 轻量数据迁移归档工具配置示例
 #
-# 三种动作（命令行 -action）：
+# 四种动作（命令行 -action）：
 #   migrate：全表模式做原子改名归档；条件模式只搬运，不删源
 #   verify ：独立校验，产出复查 SQL（写文件 + 打印控制台），只读不删
+#   sample ：独立随机抽样逐字段比对，可反复执行扩大抽查面，只读不删
 #   purge  ：删源数据，内部强制先校验，通过后才按已校验主键清单分批删
 #
 # 用法：
 #   dbmigration-lite -config config.yaml -action migrate
 #   dbmigration-lite -config config.yaml -action verify
+#   dbmigration-lite -config config.yaml -action sample -seed 12345   # 固定种子便于复现
 #   dbmigration-lite -config config.yaml -action purge
 #   dbmigration-lite -config config.yaml -action verify -table orders   # 只处理某张表
+#
+# -force 只在两处需要：全表模式源表带触发器/外键、purge 关闭了抽样。其余预检不可绕过。
 
 database:
   dsn: "user:pass@tcp(127.0.0.1:3306)/appdb?parseTime=true"
@@ -24,6 +28,7 @@ checkpoint:
 
 tables:
   # 全表模式：表不再写入，直接用改名 + 建空表归档，瞬间完成、不搬数据、天然无误删风险。
+  # 注意：本表若带触发器或自己的外键，改名后新表不带这些对象，默认拒绝，确认可接受再加 -force。
   - name: logs
     mode: full_table
     archive_table: logs_archive
@@ -33,15 +38,17 @@ tables:
     mode: conditional
     archive_table: orders_archive
     condition: "created_at < '2024-01-01 00:00:00'"   # 条件列必须不随时间被 UPDATE
-    key_column: id                  # 留空则自动探测；要求单列整型主键
+    key_column: id                  # 留空则自动探测；条件模式要求单列整型主键
     batch_size: 5000                # 每批行数
     verify:
       numeric_fields: [amount, fee] # 数值校验列，类型自动探测后按类型比对
       block_size: 100000            # 主键分块大小，用于定位差异落在哪一段
+      block_count_max: 1000         # 分块数量上限；雪花 ID 等大跨度主键会把块宽自动放大
       abs_tolerance: 0.0001         # 浮点绝对容差（整数与定点小数始终零容差）
       rel_tolerance: 0.00001        # 浮点相对容差
-      # 随机抽样逐行比对：从归档表按主键等概率抽样，抽中行回读两张表全部字段逐字段比对。
+      # 随机抽样逐行比对：从归档表按主键抽样，抽中行回读两张表全部字段逐字段比对。
       # 能抓出"两行数据互换"这类求和/计数发现不了的错误，用于部分数据迁移场景。
-      # 一次顺序扫描主键索引，成本可预测；total = sample_rounds × sample_size。
+      # 主路径是"主键区间随机探针取点"，开销与样本数成正比；小表或空洞极多时降级为顺序扫描。
+      # total = sample_rounds × sample_size。purge 前抽样被关掉时会拒绝删除（可加 -force）。
       sample_rounds: 3              # 轮数，默认 3；设为 0 关闭抽样
       sample_size: 50               # 每轮条数，默认 50；total 默认 150 行

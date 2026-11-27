@@ -265,9 +265,31 @@ func hasNewWrites(ctx context.Context, db *sql.DB, table, condition, keyCol stri
 	return true, nil
 }
 
+// JudgePurgeSamplingAllowed 判定是否允许在没有抽样的情况下执行删除。
+// 抽样是发现"两行数据互换"这类行级错位的唯一手段：记录数、求和、最值、分块计数
+// 在对称错位时会全部相等，只有逐字段回读能抓出来。因此抽样被配置关掉时默认拒绝删除，
+// 必须显式加 -force 承担漏检风险。
+func JudgePurgeSamplingAllowed(sampleEnabled, force bool) error {
+	if sampleEnabled {
+		return nil
+	}
+	if force {
+		return nil
+	}
+	return fmt.Errorf("抽样已关闭（verify.sample_rounds 或 sample_size 为 0），purge 默认拒绝执行：" +
+		"抽样是发现\"两行数据互换\"这类行级错位的唯一手段，记录数/求和/最值/分块计数在这种情况下会全部相等。" +
+		"请把 verify.sample_rounds 与 verify.sample_size 设为大于 0 后重跑，或加 -force 明确承担漏检风险")
+}
+
 // RunPurge 执行删除动作：强制先校验，全部通过才按已校验主键清单分批删。
 // 支持中途中断后从进度文件续删；每批只按实际删除行数递减计数，不再重复全表统计。
-func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed int64) error {
+func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed int64, force bool) error {
+	if err := JudgePurgeSamplingAllowed(t.Verify.SampleEnabled(), force); err != nil {
+		return err
+	}
+	if !t.Verify.SampleEnabled() {
+		fmt.Println("警告: 抽样已关闭，行级错位只能靠记录数/求和/分块计数发现，可能漏检；已按 -force 继续。")
+	}
 	fingerprint := ConfigFingerprint(*t)
 	cp, err := LoadCheckpoint(cfg.Checkpoint.Dir, t.Name)
 	if err != nil {
