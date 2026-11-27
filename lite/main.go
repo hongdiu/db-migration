@@ -56,7 +56,7 @@ func run() error {
 	action := flag.String("action", "", "动作：migrate | verify | sample | purge")
 	onlyTable := flag.String("table", "", "只处理指定表（可选，默认处理配置里的全部表）")
 	seed := flag.Int64("seed", -1, "抽样种子（verify/sample/purge 通用）：不指定则每次取当前时间戳，指定则固定便于复现")
-	force := flag.Bool("force", false, "放行默认被拒绝的危险操作（全表模式源表带触发器/外键/非主键自增列、purge 关闭抽样）；仅在明确知情时使用")
+	force := flag.Bool("force", false, "放行默认被拒绝的危险操作（条件模式源表带非主键唯一索引、全表模式源表带触发器/外键/非主键自增列、purge 关闭抽样）；仅在明确知情时使用")
 	flag.Parse()
 
 	if *action != "migrate" && *action != "verify" && *action != "sample" && *action != "purge" {
@@ -149,6 +149,19 @@ func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, act
 			if err != nil {
 				return err
 			}
+			// 唯一索引预检：搬运用 ON DUPLICATE KEY UPDATE，它在主键以外的唯一索引冲突时
+			// 同样会触发，并且整行改写归档表里的另一行（连主键一起改）。行数与汇总校验都发现不了。
+			// 放在建归档表之前，拒绝时不会留下一张空表。
+			srcIndexes, err := tableIndexes(ctx, db, t.Name)
+			if err != nil {
+				return fmt.Errorf("读取源表索引失败: %w", err)
+			}
+			if idxErr := judgeUpsertUniqueIndexes(t.Name, srcIndexes, keyCol); idxErr != nil {
+				if !force {
+					return idxErr
+				}
+				fmt.Printf("警告: %v\n已按 -force 继续：若搬运期间唯一键被改值或复用，归档表会出现整行错位，且行数校验发现不了。\n", idxErr)
+			}
 			// 归档表不存在则按源表结构创建；已存在则复用（幂等搬运可续跑）。
 			archiveExists, err := tableExists(ctx, db, t.ArchiveTable)
 			if err != nil {
@@ -169,15 +182,11 @@ func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, act
 				if err != nil {
 					return err
 				}
-				srcIdx, err := tableIndexes(ctx, db, t.Name)
-				if err != nil {
-					return err
-				}
 				arcIdx, err := tableIndexes(ctx, db, t.ArchiveTable)
 				if err != nil {
 					return err
 				}
-				if err := CompareTableStructure(t.Name, t.ArchiveTable, srcCols, arcCols, srcIdx, arcIdx); err != nil {
+				if err := CompareTableStructure(t.Name, t.ArchiveTable, srcCols, arcCols, srcIndexes, arcIdx); err != nil {
 					return err
 				}
 				fmt.Printf("归档表 %s 已存在，结构校验通过，按已有进度继续。\n", t.ArchiveTable)

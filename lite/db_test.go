@@ -106,6 +106,57 @@ func TestCompareTableStructureIndexes(t *testing.T) {
 	}
 }
 
+func TestUpsertConflictIndexes(t *testing.T) {
+	primary := IndexMeta{Name: "PRIMARY", Unique: true, Columns: []string{"id"}}
+	// 只有主键：ON DUPLICATE KEY UPDATE 只会命中主键，安全。
+	if got := upsertConflictIndexes([]IndexMeta{primary}, "id"); len(got) != 0 {
+		t.Fatalf("只有主键时不应报冲突: %+v", got)
+	}
+	// 非主键唯一索引：必须列出。
+	ukOrder := IndexMeta{Name: "uk_order", Unique: true, Columns: []string{"order_no"}}
+	got := upsertConflictIndexes([]IndexMeta{primary, ukOrder}, "id")
+	if len(got) != 1 || got[0].Name != "uk_order" {
+		t.Fatalf("应识别出 uk_order 冲突: %+v", got)
+	}
+	// 复合唯一索引同样会触发整行覆盖。
+	ukPair := IndexMeta{Name: "uk_pair", Unique: true, Columns: []string{"merchant_id", "biz_no"}}
+	if got := upsertConflictIndexes([]IndexMeta{primary, ukPair}, "id"); len(got) != 1 {
+		t.Fatalf("复合唯一索引应报冲突: %+v", got)
+	}
+	// 与主键同列的唯一索引不引入新冲突面（命中它必然也命中主键），大小写与顺序无关。
+	sameKey := IndexMeta{Name: "uk_id", Unique: true, Columns: []string{"ID"}}
+	if got := upsertConflictIndexes([]IndexMeta{primary, sameKey}, "id"); len(got) != 0 {
+		t.Fatalf("与主键同列的唯一索引不应误报: %+v", got)
+	}
+	// 普通索引不参与唯一性判定。
+	plain := IndexMeta{Name: "idx_order", Unique: false, Columns: []string{"order_no"}}
+	if got := upsertConflictIndexes([]IndexMeta{primary, plain}, "id"); len(got) != 0 {
+		t.Fatalf("普通索引不应报冲突: %+v", got)
+	}
+	// 没有 PRIMARY 记录时按 keyCol 兜底，仍能识别出"同列唯一索引"。
+	if got := upsertConflictIndexes([]IndexMeta{sameKey}, "id"); len(got) != 0 {
+		t.Fatalf("无 PRIMARY 记录时应按 keyCol 兜底: %+v", got)
+	}
+}
+
+func TestJudgeUpsertUniqueIndexes(t *testing.T) {
+	primary := IndexMeta{Name: "PRIMARY", Unique: true, Columns: []string{"id"}}
+	if err := judgeUpsertUniqueIndexes("orders", []IndexMeta{primary}, "id"); err != nil {
+		t.Fatalf("只有主键应放行: %v", err)
+	}
+	uk := IndexMeta{Name: "uk_order", Unique: true, Columns: []string{"order_no"}}
+	err := judgeUpsertUniqueIndexes("orders", []IndexMeta{primary, uk}, "id")
+	if err == nil {
+		t.Fatal("存在非主键唯一索引应拒绝")
+	}
+	msg := err.Error()
+	for _, want := range []string{"uk_order", "order_no", "ON DUPLICATE KEY UPDATE", "-force"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("提示信息应包含 %q，实际：%s", want, msg)
+		}
+	}
+}
+
 func TestJudgeArchiveTableFree(t *testing.T) {
 	if err := judgeArchiveTableFree(false, "orders_archive"); err != nil {
 		t.Fatalf("归档表不存在应允许: %v", err)

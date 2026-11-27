@@ -179,6 +179,87 @@ func CompareTableStructure(srcTable, srcArchive string, src, dst []ColumnMeta, s
 	return nil
 }
 
+// primaryIndexColumns 取主键列序列（PRIMARY 索引）。探测不到时退回单列 keyCol。
+func primaryIndexColumns(idxs []IndexMeta, keyCol string) []string {
+	for _, idx := range idxs {
+		if strings.EqualFold(idx.Name, "PRIMARY") {
+			return idx.Columns
+		}
+	}
+	if keyCol != "" {
+		return []string{keyCol}
+	}
+	return nil
+}
+
+// sameColumnSet 比较两组列名是否构成同一组（忽略顺序与大小写）。
+// 唯一索引的约束只取决于列集合，UNIQUE(a,b) 与 UNIQUE(b,a) 等价。
+func sameColumnSet(a, b []string) bool {
+	if len(a) != len(b) || len(a) == 0 {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, c := range a {
+		seen[strings.ToLower(c)]++
+	}
+	for _, c := range b {
+		k := strings.ToLower(c)
+		if seen[k] == 0 {
+			return false
+		}
+		seen[k]--
+	}
+	return true
+}
+
+// upsertConflictIndexes 列出会让 ON DUPLICATE KEY UPDATE 命中"主键以外那一行"的唯一索引。
+//
+// MySQL 的 ON DUPLICATE KEY UPDATE 在任何唯一索引冲突时都会触发，不只是主键。
+// 归档表结构复制自源表，源表上的 UNIQUE(order_no) 在归档表上同样存在：
+// 若源表某行的 order_no 与归档表里"另一行"相同（源表改过值，或旧行删除后新行复用了该值），
+// 写入会按唯一键命中那一行并整行改写，连主键都会被改成新值——归档表里原本已归档的
+// 那条记录就此消失，而记录数、求和、最值、非空数、分块计数全都不会变，只有抽样碰巧
+// 抽中才看得出。错误数据一旦通过闸门，purge 会按归档表主键清单删掉源表，原值无从恢复。
+//
+// 与主键列完全相同的唯一索引（如 UNIQUE(id)）不引入新的冲突面：命中它必然也命中主键，
+// 效果与主键覆盖一致，不算风险。
+func upsertConflictIndexes(idxs []IndexMeta, keyCol string) []IndexMeta {
+	primary := primaryIndexColumns(idxs, keyCol)
+	var out []IndexMeta
+	for _, idx := range idxs {
+		if !idx.Unique || strings.EqualFold(idx.Name, "PRIMARY") {
+			continue
+		}
+		if sameColumnSet(idx.Columns, primary) {
+			continue
+		}
+		out = append(out, idx)
+	}
+	return out
+}
+
+// judgeUpsertUniqueIndexes 判定能否安全使用 ON DUPLICATE KEY UPDATE 搬运。
+// 只报事实和处置办法，是否继续由调用方按 -force 决定。
+func judgeUpsertUniqueIndexes(sourceTable string, idxs []IndexMeta, keyCol string) error {
+	conflicts := upsertConflictIndexes(idxs, keyCol)
+	if len(conflicts) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("源表 %s 上存在主键之外的唯一索引。条件模式搬运写入用的是 INSERT ... ON DUPLICATE KEY UPDATE，", sourceTable))
+	sb.WriteString("而 MySQL 在任何唯一索引冲突时都会触发它，不只主键：")
+	for _, idx := range conflicts {
+		sb.WriteString(fmt.Sprintf("\n  - 唯一索引 %s（%s）", idx.Name, strings.Join(idx.Columns, ", ")))
+	}
+	sb.WriteString("\n一旦源表某行的上述唯一键与归档表里另一行相同（值被改过，或旧行删除后新行复用了该值），")
+	sb.WriteString("写入会整行改写归档表里那一行、连主键一起改：归档表丢失一条已归档记录、多出一条新记录。")
+	sb.WriteString("\n此时记录数、求和、最值、非空数、分块计数全部相等，抽样没抽中就完全看不出；")
+	sb.WriteString("而错误数据一旦过了闸门，purge 会按归档表主键清单删掉源表，被覆盖的原值无法恢复。")
+	sb.WriteString("\n处置：确认这些唯一列在搬运期间不会被改值、也不会删除后复用，然后加 -force 继续；")
+	sb.WriteString("\n或改用其它搬运方式（例如按主键区间 INSERT IGNORE 后逐行复核），不要依赖该语句的去重语义。")
+	return fmt.Errorf("%s", sb.String())
+}
+
 // isGeneratedColumn 判断是否为生成列（虚拟或存储），这类列不能显式插入。
 func isGeneratedColumn(extra string) bool {
 	u := strings.ToUpper(extra)
