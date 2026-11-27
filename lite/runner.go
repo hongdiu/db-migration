@@ -33,15 +33,22 @@ func buildReviewFields(ctx context.Context, db *sql.DB, table string, configured
 
 // VerifyOutcome 是一次完整校验的全部产出。
 type VerifyOutcome struct {
-	Results      []CheckResult
-	Fields       []ReviewField
-	SampleRounds [][]int64 // 抽中的主键（按轮），用于复查 SQL 输出
-	KeyCol       string    // 探测到的真实主键列名
+	Results          []CheckResult
+	Fields           []ReviewField
+	SampleRounds     [][]int64 // 抽中的主键（按轮），用于复查 SQL 输出
+	KeyCol           string    // 探测到的真实主键列名
+	ArchiveCondition string    // 归档表附加过滤条件（续跑时排除已删部分）
 }
 
-// RunVerify 执行完整校验（只读）。
-// verify 和 purge 共用本函数，保证人工核对与删除门禁用的是同一套判定。
+// RunVerify 执行全量校验（只读），verify 动作使用。
 func RunVerify(ctx context.Context, db *sql.DB, t *TableCfg) (*VerifyOutcome, error) {
+	return RunVerifyRange(ctx, db, t, 0)
+}
+
+// RunVerifyRange 校验归档表中主键大于 startKey 的部分与源表剩余数据是否一致。
+// 删除续跑时传入上次删除到的主键，避免把已经删掉的部分算进校验。
+// verify 和 purge 共用本函数，保证人工核对与删除门禁用的是同一套判定。
+func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey int64) (*VerifyOutcome, error) {
 	// 主键探测（分块与删除门禁都依赖整型主键）。
 	pk, err := probePrimaryKey(ctx, db, t.Name)
 	if err != nil {
@@ -51,6 +58,7 @@ func RunVerify(ctx context.Context, db *sql.DB, t *TableCfg) (*VerifyOutcome, er
 	if err != nil {
 		return nil, err
 	}
+	archiveCond := BuildSampleWhereByKey(keyCol, startKey)
 
 	var results []CheckResult
 
@@ -59,7 +67,7 @@ func RunVerify(ctx context.Context, db *sql.DB, t *TableCfg) (*VerifyOutcome, er
 	if err != nil {
 		return nil, fmt.Errorf("统计源表行数失败: %w", err)
 	}
-	archiveCount, err := countRows(ctx, db, t.ArchiveTable, "")
+	archiveCount, err := countRows(ctx, db, t.ArchiveTable, archiveCond)
 	if err != nil {
 		return nil, fmt.Errorf("统计归档表行数失败: %w", err)
 	}
@@ -77,7 +85,7 @@ func RunVerify(ctx context.Context, db *sql.DB, t *TableCfg) (*VerifyOutcome, er
 		if err != nil {
 			return nil, err
 		}
-		dstSum, err := aggregateValue(ctx, db, "SUM", f.Name, t.ArchiveTable, keyCol, "", nil)
+		dstSum, err := aggregateValue(ctx, db, "SUM", f.Name, t.ArchiveTable, keyCol, archiveCond, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -89,7 +97,7 @@ func RunVerify(ctx context.Context, db *sql.DB, t *TableCfg) (*VerifyOutcome, er
 			if err != nil {
 				return nil, err
 			}
-			dstV, err := aggregateValue(ctx, db, opName, f.Name, t.ArchiveTable, keyCol, "", nil)
+			dstV, err := aggregateValue(ctx, db, opName, f.Name, t.ArchiveTable, keyCol, archiveCond, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -99,8 +107,10 @@ func RunVerify(ctx context.Context, db *sql.DB, t *TableCfg) (*VerifyOutcome, er
 	}
 
 	// 4. 主键分块计数：用归档表的主键区间切块，逐块比对，定位差异落在哪一段。
+	// 续跑时只取尚未删除的区间作为边界，跳过已删部分。
 	var lo, hi sql.NullInt64
-	if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s", qIdent(keyCol), qIdent(keyCol), qIdent(t.ArchiveTable))).Scan(&lo, &hi); err != nil {
+	rangeSQL := fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s%s", qIdent(keyCol), qIdent(keyCol), qIdent(t.ArchiveTable), sampleWhere(archiveCond))
+	if err := db.QueryRowContext(ctx, rangeSQL).Scan(&lo, &hi); err != nil {
 		return nil, fmt.Errorf("读取归档表主键范围失败: %w", err)
 	}
 	if lo.Valid && hi.Valid {
@@ -109,7 +119,7 @@ func RunVerify(ctx context.Context, db *sql.DB, t *TableCfg) (*VerifyOutcome, er
 			if err != nil {
 				return nil, err
 			}
-			dc, err := countRowsInBlock(ctx, db, t.ArchiveTable, keyCol, "", block)
+			dc, err := countRowsInBlock(ctx, db, t.ArchiveTable, keyCol, archiveCond, block)
 			if err != nil {
 				return nil, err
 			}
@@ -122,7 +132,7 @@ func RunVerify(ctx context.Context, db *sql.DB, t *TableCfg) (*VerifyOutcome, er
 	var sampleRounds [][]int64
 	if t.Verify.SampleEnabled() {
 		// 抽样种子固定为 0，保证同一批数据每次校验抽到相同的行，便于复现和人工核对。
-		sampled, err := SampleKeys(ctx, db, t.ArchiveTable, keyCol, t.Verify.Rounds(), t.Verify.PerRound(), 0)
+		sampled, err := SampleKeysWithCondition(ctx, db, t.ArchiveTable, keyCol, archiveCond, t.Verify.Rounds(), t.Verify.PerRound(), 0)
 		if err != nil {
 			return nil, err
 		}
@@ -150,7 +160,7 @@ func RunVerify(ctx context.Context, db *sql.DB, t *TableCfg) (*VerifyOutcome, er
 		}
 	}
 
-	return &VerifyOutcome{Results: results, Fields: fields, SampleRounds: sampleRounds, KeyCol: keyCol}, nil
+	return &VerifyOutcome{Results: results, Fields: fields, SampleRounds: sampleRounds, KeyCol: keyCol, ArchiveCondition: archiveCond}, nil
 }
 
 // DoVerify 执行校验动作：跑校验 + 出复查 SQL（文件 + 控制台）。
@@ -160,7 +170,7 @@ func DoVerify(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg) error {
 		return err
 	}
 	results := outcome.Results
-	sqlText := BuildReviewSQL(t.Name, t.ArchiveTable, t.Condition, outcome.KeyCol, outcome.Fields,
+	sqlText := BuildReviewSQLWithArchiveCondition(t.Name, t.ArchiveTable, t.Condition, outcome.ArchiveCondition, outcome.KeyCol, outcome.Fields,
 		ResultsToReviewItems(results), outcome.SampleRounds, t.Verify.AbsTolerance, t.Verify.RelTolerance)
 	if _, err := OutputReviewSQL(cfg.Output.Dir, t.Name, sqlText); err != nil {
 		return err
@@ -172,16 +182,54 @@ func DoVerify(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg) error {
 	return nil
 }
 
+// hasNewWrites 检查是否有新数据落入归档范围。
+// 只看主键大于已归档最大主键的行，命中一条立即返回，走主键索引极快。
+func hasNewWrites(ctx context.Context, db *sql.DB, table, condition, keyCol string, maxArchived sql.NullInt64) (bool, error) {
+	if !maxArchived.Valid {
+		return false, nil
+	}
+	q := BuildNewWriteCheckQuery(table, condition, keyCol, maxArchived.Int64)
+	var one int
+	err := db.QueryRowContext(ctx, q).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // RunPurge 执行删除动作：强制先校验，全部通过才按已校验主键清单分批删。
+// 支持中途中断后从进度文件续删；每批只按实际删除行数递减计数，不再重复全表统计。
 func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg) error {
-	// 删除前强制复核，不通过直接返回，源表不动。
-	outcome, err := RunVerify(ctx, db, t)
+	fingerprint := ConfigFingerprint(*t)
+	cp, err := LoadCheckpoint(cfg.Checkpoint.Dir, t.Name)
+	if err != nil {
+		return err
+	}
+	if cp != nil && cp.Stage == "purged" && cp.Fingerprint == fingerprint {
+		fmt.Printf("表 %s 已标记为删除完成，跳过；如需重做请删除进度文件。\n", t.Name)
+		return nil
+	}
+	progress, err := JudgePurgeProgress(cp, fingerprint)
+	if err != nil {
+		return err
+	}
+	startKey := progress.StartKey
+	deletedSoFar := progress.DeletedBefore
+	if progress.Resuming {
+		fmt.Printf("表 %s 从断点续删：起点主键 %d，此前已删 %d 行。\n", t.Name, startKey, deletedSoFar)
+	}
+
+	// 删除前强制复核：续跑时只校验尚未删除的部分，已删部分不参与比对。
+	outcome, err := RunVerifyRange(ctx, db, t, startKey)
 	if err != nil {
 		return err
 	}
 	results := outcome.Results
 	if !AllPassed(results) {
-		sqlText := BuildReviewSQL(t.Name, t.ArchiveTable, t.Condition, outcome.KeyCol, nil,
+		sqlText := BuildReviewSQLWithArchiveCondition(t.Name, t.ArchiveTable, t.Condition, outcome.ArchiveCondition, outcome.KeyCol, nil,
 			ResultsToReviewItems(results), outcome.SampleRounds, t.Verify.AbsTolerance, t.Verify.RelTolerance)
 		_, _ = OutputReviewSQL(cfg.Output.Dir, t.Name, sqlText)
 		return fmt.Errorf("删除前校验未通过，已停止；源表未做任何改动，请按复查 SQL 排查")
@@ -206,13 +254,29 @@ func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg) error {
 		return err
 	}
 
-	var deletedSoFar int64
-	var lastKey int64
+	// 开始前先看一眼有没有新数据落入归档范围，保住原有告警能力。
+	newWrite, err := hasNewWrites(ctx, db, t.Name, t.Condition, keyCol, maxArchived)
+	if err != nil {
+		return err
+	}
+	if newWrite {
+		return fmt.Errorf("删除前检查发现源表有新数据落入归档范围（主键大于已归档最大值），请先重新搬运并校验，再执行删除")
+	}
+
+	// 待删总数只查一次，之后用每批实际删除行数递减，不再每批全表计数。
+	srcRemaining, err := countRows(ctx, db, t.Name, t.Condition)
+	if err != nil {
+		return err
+	}
+	lastKey := startKey
+	var copyLastKey, copyRowsDone int64
+	if cp != nil {
+		copyLastKey, copyRowsDone = cp.LastKey, cp.RowsDone
+	}
+
 	for {
 		// 从归档表取一批已校验的主键（这些就是允许删除的范围）。
-		rows, err := db.QueryContext(ctx,
-			fmt.Sprintf("SELECT %s FROM %s WHERE %s > %d ORDER BY %s LIMIT %d",
-				qIdent(keyCol), qIdent(t.ArchiveTable), qIdent(keyCol), lastKey, qIdent(keyCol), t.BatchSize))
+		rows, err := db.QueryContext(ctx, BuildArchivedKeysQuery(t.ArchiveTable, keyCol, lastKey, t.BatchSize))
 		if err != nil {
 			return err
 		}
@@ -233,10 +297,6 @@ func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg) error {
 			break
 		}
 
-		srcRemaining, err := countRows(ctx, db, t.Name, t.Condition)
-		if err != nil {
-			return err
-		}
 		verdict := PurgeVerdict{
 			SrcRowsToDelete: srcRemaining,
 			DeletedSoFar:    deletedSoFar,
@@ -256,9 +316,36 @@ func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg) error {
 		if err != nil {
 			return err
 		}
-		deletedSoFar += affected
+		// 实际删除数与计划不符，说明数据被外部改动，立即停止，不继续带错往下删。
+		if affected != int64(len(keys)) {
+			return fmt.Errorf("本批计划删 %d 行，实际删 %d 行（数据可能被外部改动），已停止", len(keys), affected)
+		}
+		srcRemaining, deletedSoFar = ApplyPurgeBatch(srcRemaining, deletedSoFar, affected)
 		lastKey = keys[len(keys)-1]
+
+		// 原子写续跑断点：搬运信息原样保留，追加删除进度。
+		next := &Checkpoint{
+			Fingerprint:  fingerprint,
+			Table:        t.Name,
+			LastKey:      copyLastKey,
+			RowsDone:     copyRowsDone,
+			PurgeLastKey: lastKey,
+			PurgeDeleted: deletedSoFar,
+			Stage:        "purging",
+		}
+		if err := SaveCheckpoint(cfg.Checkpoint.Dir, t.Name, next); err != nil {
+			return err
+		}
 		fmt.Printf("表 %s 已删 %d 行（累计 %d）。\n", t.Name, affected, deletedSoFar)
+	}
+
+	// 删完再看一眼，防止删除期间有新数据落入归档范围。
+	newWrite, err = hasNewWrites(ctx, db, t.Name, t.Condition, keyCol, maxArchived)
+	if err != nil {
+		return err
+	}
+	if newWrite {
+		return fmt.Errorf("删除期间发现新数据落入归档范围，已停止；请重新搬运并校验后再删")
 	}
 
 	// 删后残留必须为 0（限定在已归档主键范围内）。
@@ -272,5 +359,16 @@ func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg) error {
 			return fmt.Errorf("删除后源表仍有 %d 行命中数据，请排查", remain)
 		}
 	}
-	return nil
+
+	// 标记完成，避免误重跑时把已删数据当成新任务。
+	done := &Checkpoint{
+		Fingerprint:  fingerprint,
+		Table:        t.Name,
+		LastKey:      copyLastKey,
+		RowsDone:     copyRowsDone,
+		PurgeLastKey: lastKey,
+		PurgeDeleted: deletedSoFar,
+		Stage:        "purged",
+	}
+	return SaveCheckpoint(cfg.Checkpoint.Dir, t.Name, done)
 }

@@ -120,11 +120,23 @@ func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, act
 			if err := JudgeCheckpointResumable(cp, ConfigFingerprint(*t)); err != nil {
 				return err
 			}
-			if err := RunCopy(ctx, db, cfg, t, keyCol, columns, cp); err != nil {
-				return err
-			}
-			fmt.Printf("表 %s 搬运完成，请执行 -action verify 复核。\n", t.Name)
-			return nil
+		if err := RunCopy(ctx, db, cfg, t, keyCol, columns, cp); err != nil {
+			return err
+		}
+		// 循环退出只代表游标走到头，必须立刻核对行数，避免把漏搬当成搬运完成。
+		srcCount, err := countRows(ctx, db, t.Name, t.Condition)
+		if err != nil {
+			return fmt.Errorf("核对源表命中行数失败: %w", err)
+		}
+		archiveCount, err := countRows(ctx, db, t.ArchiveTable, "")
+		if err != nil {
+			return fmt.Errorf("核对归档表行数失败: %w", err)
+		}
+		if err := JudgeCopyCounts(srcCount, archiveCount); err != nil {
+			return err
+		}
+		fmt.Printf("表 %s 搬运完成（源表命中 %d 行，归档表 %d 行），请执行 -action verify 复核。\n", t.Name, srcCount, archiveCount)
+		return nil
 		case "verify":
 			return DoVerify(ctx, db, cfg, t)
 		case "purge":

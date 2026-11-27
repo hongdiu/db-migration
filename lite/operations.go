@@ -16,20 +16,23 @@ import (
 
 // ============ 条件模式：分批搬运 ============
 
-// BuildCopyQuery 生成一批搬运 SQL：按主键游标取一批，写入归档表，重复主键覆盖（幂等）。
-func BuildCopyQuery(source, archive string, columns []string, keyCol, condition string, lastKey, batchSize int64) string {
+// BuildCopySelectQuery 生成"本批待搬运数据"的 SELECT。
+// 搬运写入和游标推进必须共用本函数，否则两处 WHERE 一旦漂移，就会按全表主键推进、
+// 却只搬命中条件的数据，导致游标越过尚未搬运的行而漏数据。
+func BuildCopySelectQuery(source string, columns []string, keyCol, condition string, lastKey, batchSize int64) string {
 	where := fmt.Sprintf("%s > %d", qIdent(keyCol), lastKey)
 	if condition != "" {
 		where = "(" + condition + ") AND " + where
 	}
 	colList := strings.Join(columns, ",")
-	placeholders := make([]string, len(columns))
-	for i := range placeholders {
-		placeholders[i] = "?"
-	}
-	_ = placeholders // 列值来自 SELECT，不用占位符
-	selectSQL := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT %d",
+	return fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT %d",
 		colList, qIdent(source), where, qIdent(keyCol), batchSize)
+}
+
+// BuildCopyQuery 生成一批搬运 SQL：按主键游标取一批，写入归档表，重复主键覆盖（幂等）。
+func BuildCopyQuery(source, archive string, columns []string, keyCol, condition string, lastKey, batchSize int64) string {
+	colList := strings.Join(columns, ",")
+	selectSQL := BuildCopySelectQuery(source, columns, keyCol, condition, lastKey, batchSize)
 	updates := make([]string, 0, len(columns))
 	for _, c := range columns {
 		updates = append(updates, fmt.Sprintf("%s = VALUES(%s)", c, c))
@@ -56,31 +59,42 @@ func RunCopy(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, keyCol s
 		rowsDone = cp.RowsDone
 	}
 	for {
-		query := BuildCopyQuery(t.Name, t.ArchiveTable, columns, keyCol, t.Condition, lastKey, int64(t.BatchSize))
-		res, err := db.ExecContext(ctx, query)
+		// 先读出本批命中条件的主键。列表为空才算真的没有更多数据。
+		// 不能用 INSERT ... ON DUPLICATE KEY UPDATE 的 RowsAffected 判断结束：
+		// 行已存在且值未变时它也返回 0，断点续跑会被误判成"没有更多数据"。
+		keysSQL := BuildCopySelectQuery(t.Name, []string{qIdent(keyCol)}, keyCol, t.Condition, lastKey, int64(t.BatchSize))
+		rows, err := db.QueryContext(ctx, keysSQL)
 		if err != nil {
+			return fmt.Errorf("读取搬运批次失败（lastKey=%d）: %w", lastKey, err)
+		}
+		var keys []int64
+		for rows.Next() {
+			var k int64
+			if err := rows.Scan(&k); err != nil {
+				rows.Close()
+				return fmt.Errorf("读取搬运批次主键失败（lastKey=%d）: %w", lastKey, err)
+			}
+			keys = append(keys, k)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		state, err := JudgeCopyBatch(keys, lastKey, rowsDone)
+		if err != nil {
+			return err
+		}
+		if state.Done {
+			break
+		}
+
+		query := BuildCopyQuery(t.Name, t.ArchiveTable, columns, keyCol, t.Condition, lastKey, int64(t.BatchSize))
+		if _, err := db.ExecContext(ctx, query); err != nil {
 			return fmt.Errorf("搬运批次失败（lastKey=%d）: %w", lastKey, err)
 		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("读取影响行数失败: %w", err)
-		}
-		if affected == 0 {
-			break // 没有更多数据
-		}
-		rowsDone += affected
-
-		// 取本批最大主键，推进游标。
-		maxSQL := fmt.Sprintf("SELECT MAX(%s) FROM (SELECT %s FROM %s WHERE %s > %d ORDER BY %s LIMIT %d) AS batch",
-			qIdent(keyCol), qIdent(keyCol), qIdent(t.Name), qIdent(keyCol), lastKey, qIdent(keyCol), t.BatchSize)
-		var nextKey sql.NullInt64
-		if err := db.QueryRowContext(ctx, maxSQL).Scan(&nextKey); err != nil {
-			return fmt.Errorf("读取批次主键上界失败: %w", err)
-		}
-		if !nextKey.Valid || nextKey.Int64 <= lastKey {
-			return fmt.Errorf("游标未前进（lastKey=%d，next=%v），为避免死循环已停止", lastKey, nextKey)
-		}
-		lastKey = nextKey.Int64
+		lastKey = state.LastKey
+		rowsDone = state.RowsDone
 
 		newCP := &Checkpoint{
 			Fingerprint: ConfigFingerprint(*t),
@@ -94,6 +108,40 @@ func RunCopy(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, keyCol s
 		}
 	}
 	return nil
+}
+
+// CopyBatchState 是本批搬运后应更新的进度。
+type CopyBatchState struct {
+	LastKey  int64
+	RowsDone int64
+	Done     bool // 本批为空，没有更多符合条件的数据
+}
+
+// JudgeCopyBatch 根据本批查到的主键列表决定游标如何推进。
+// keys 按主键升序排列，最后一条即本批上界；列表为空才表示真的搬完了。
+func JudgeCopyBatch(keys []int64, lastKey, rowsDone int64) (CopyBatchState, error) {
+	if len(keys) == 0 {
+		return CopyBatchState{LastKey: lastKey, RowsDone: rowsDone, Done: true}, nil
+	}
+	next := keys[len(keys)-1]
+	if next <= lastKey {
+		return CopyBatchState{}, fmt.Errorf("游标未前进（lastKey=%d，next=%d），为避免死循环已停止", lastKey, next)
+	}
+	return CopyBatchState{LastKey: next, RowsDone: rowsDone + int64(len(keys))}, nil
+}
+
+// JudgeCopyCounts 判定搬运结束后的行数是否对齐。
+// 搬运循环退出只说明游标走到了头，不等于命中条件的数据都搬完了；
+// 只有两侧行数相等才能对外报"搬运完成"。
+func JudgeCopyCounts(srcCount, archiveCount int64) error {
+	if srcCount == archiveCount {
+		return nil
+	}
+	diff := srcCount - archiveCount
+	if diff < 0 {
+		diff = -diff
+	}
+	return fmt.Errorf("搬运结束但行数不一致：源表命中 %d 行，归档表 %d 行（相差 %d 行）；请勿执行 purge，先重新搬运并核对", srcCount, archiveCount, diff)
 }
 
 // ============ 条件模式：按主键清单删除 ============
@@ -148,6 +196,30 @@ func BuildRemainingCountQuery(table, keyCol, condition string, maxArchivedKey in
 		where += fmt.Sprintf(" AND %s <= %d", qIdent(keyCol), maxArchivedKey)
 	}
 	return fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", qIdent(table), where)
+}
+
+// ApplyPurgeBatch 按本批实际删除行数推进计数。
+// 待删数递减、已删数累加，两者之和保持不变，守恒判定因此不需要重新查库。
+func ApplyPurgeBatch(srcRemaining, deletedSoFar, affected int64) (int64, int64) {
+	return srcRemaining - affected, deletedSoFar + affected
+}
+
+// BuildNewWriteCheckQuery 生成"是否有新数据落入归档范围"的检查 SQL。
+// 只看主键大于已归档最大主键、且满足迁移条件的行；命中一条即返回，走主键索引。
+// 删除开始前和结束后各跑一次，用于补回增量计数丢失的"有人在写数据"提醒。
+func BuildNewWriteCheckQuery(table, condition, keyCol string, maxArchivedKey int64) string {
+	clause := fmt.Sprintf("%s > %d", qIdent(keyCol), maxArchivedKey)
+	if condition != "" {
+		clause = "(" + condition + ") AND " + clause
+	}
+	return fmt.Sprintf("SELECT 1 FROM %s WHERE %s LIMIT 1", qIdent(table), clause)
+}
+
+// BuildArchivedKeysQuery 生成从归档表取待删主键清单的 SQL。
+// startKey 是续跑起点：只取主键大于它的行，避免重复删除。
+func BuildArchivedKeysQuery(archive, keyCol string, startKey int64, batchSize int) string {
+	return fmt.Sprintf("SELECT %s FROM %s WHERE %s > %d ORDER BY %s LIMIT %d",
+		qIdent(keyCol), qIdent(archive), qIdent(keyCol), startKey, qIdent(keyCol), batchSize)
 }
 
 // ============ 全表模式：预检 + 建空表 + 自增值对齐 + 原子改名 ============

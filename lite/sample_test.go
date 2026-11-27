@@ -105,3 +105,74 @@ func TestShuffleAndSplitShortPool(t *testing.T) {
 		t.Fatalf("短池切分不对: %+v", rounds)
 	}
 }
+
+func TestMakeSampleRanges(t *testing.T) {
+	ranges := MakeSampleRanges(1, 10, 4)
+	if len(ranges) != 4 {
+		t.Fatalf("应切 4 个区间: %+v", ranges)
+	}
+	if ranges[0].Lo != 1 || ranges[len(ranges)-1].Hi != 10 {
+		t.Fatalf("区间应覆盖完整范围: %+v", ranges)
+	}
+	for i := range ranges {
+		if ranges[i].Lo > ranges[i].Hi {
+			t.Fatalf("区间下界不能超过上界: %+v", ranges[i])
+		}
+		if i > 0 && ranges[i].Lo != ranges[i-1].Hi+1 {
+			t.Fatalf("区间应连续不重叠: %+v", ranges)
+		}
+	}
+}
+
+func TestMakeSampleRangesHolesAndExtremes(t *testing.T) {
+	// 主键范围极大、区间数很多：不能溢出，区间仍连续。
+	ranges := MakeSampleRanges(1, 1<<40, 7)
+	if len(ranges) != 7 || ranges[0].Lo != 1 || ranges[6].Hi != 1<<40 {
+		t.Fatalf("大范围切分区间不对: %+v", ranges)
+	}
+	// 接近 int64 上界，验证无符号跨度计算不溢出。
+	nearMax := int64(^uint64(0) >> 1)
+	ranges = MakeSampleRanges(nearMax-3, nearMax, 10)
+	if len(ranges) == 0 || ranges[len(ranges)-1].Hi != nearMax {
+		t.Fatalf("极值边界切分不对: %+v", ranges)
+	}
+	for _, r := range ranges {
+		if r.Lo < nearMax-3 || r.Hi > nearMax || r.Lo > r.Hi {
+			t.Fatalf("极值区间越界: %+v", r)
+		}
+	}
+	// 空表和非法参数应返回空。
+	if MakeSampleRanges(10, 1, 3) != nil || MakeSampleRanges(1, 10, 0) != nil {
+		t.Fatal("空表或非法区间数应返回 nil")
+	}
+}
+
+func TestPickSampleCandidates(t *testing.T) {
+	rng := rand.New(rand.NewSource(9))
+	candidates := []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	chosen, ok := PickSampleCandidates(candidates, 5, rng)
+	if !ok || len(chosen) != 5 {
+		t.Fatalf("候选足够时应选中 5 个: ok=%v chosen=%+v", ok, chosen)
+	}
+	seen := make(map[int64]bool)
+	for _, k := range chosen {
+		if seen[k] {
+			t.Fatalf("选中主键不应重复: %+v", chosen)
+		}
+		seen[k] = true
+	}
+}
+
+func TestPickSampleCandidatesDedupAndFallback(t *testing.T) {
+	rng := rand.New(rand.NewSource(9))
+	// 重复候选先去重，只有 3 个不重复键，取 5 个应触发降级。
+	chosen, ok := PickSampleCandidates([]int64{1, 1, 2, 2, 3, 3}, 5, rng)
+	if ok || len(chosen) != 0 {
+		t.Fatalf("候选不足应返回 false: ok=%v chosen=%+v", ok, chosen)
+	}
+	// 去重后刚好够数，应正常选中。
+	chosen, ok = PickSampleCandidates([]int64{7, 7, 8, 8, 9}, 3, rng)
+	if !ok || len(chosen) != 3 {
+		t.Fatalf("去重后足够应选中 3 个: ok=%v chosen=%+v", ok, chosen)
+	}
+}

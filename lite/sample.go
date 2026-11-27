@@ -1,13 +1,13 @@
-// 蓄水池抽样（Reservoir Sampling，Algorithm R）。
+// 抽样：从归档表取少量主键，用于逐字段比对。
 //
-// 目的：从归档表按主键做一次顺序扫描，等概率抽出若干行，用于逐字段比对。
+// 主路径是"分区取点"：把主键范围切成若干等宽区间（数量是样本数的 3 倍，用于对抗主键空洞），
+// 每个区间只在数据库里查一条，拿到候选后洗牌取所需数量。全程不把全部主键读到程序里，
+// 几千万行的表也只返回几百行，避免原先把几千万个主键逐行传输到客户端的开销。
 //
-// 为什么用蓄水池：
-//   - 无偏：每一行被抽中的概率相等，不会像"按主键区间取模"那样在主键有空洞时整段漏抽。
-//   - 一次扫描：只读主键索引，成本 O(N)，可预测；不需要先 COUNT 再算随机偏移。
-//   - 流式：不需要把全部主键装进内存，池子多大就占多少内存。
+// 降级路径是"蓄水池抽样"：候选不足时（表很小或主键空洞极多）改回原来的流式全扫描。
+// 蓄水池对每一行等概率，不会因主键空洞整段漏抽，适合小表。
 //
-// 结果按轮切分：池容量 = rounds × size，扫描结束后洗牌，再切成 rounds 轮，轮间不重叠。
+// 两条路径最终都把选中的主键按轮切分，轮间不重叠。
 package main
 
 import (
@@ -16,6 +16,72 @@ import (
 	"fmt"
 	"math/rand"
 )
+
+// MakeSampleRanges 把主键范围切成 count 个等宽区间，供分区取点使用。
+// 主键有空洞时部分区间会查不到行，调用方跳过即可；区间宽度至少为 1，不会出现空区间。
+// 跨度用无符号计算，避免两个极值相减溢出。
+func MakeSampleRanges(minKey, maxKey int64, count int) []BlockRange {
+	if count <= 0 || minKey > maxKey {
+		return nil
+	}
+	minU, maxU := uint64(minKey), uint64(maxKey)
+	span := maxU - minU
+	// 按跨度等分，余数分摊到前面的区间，保证各区间尽量等宽且连续覆盖。
+	base := span / uint64(count)
+	extra := span % uint64(count)
+
+	ranges := make([]BlockRange, 0, count)
+	cur := minU
+	for i := 0; i < count; i++ {
+		if cur > maxU {
+			break
+		}
+		width := base
+		if uint64(i) < extra {
+			width++ // 前 extra 个区间多覆盖一个键值
+		}
+		if width == 0 {
+			break // 键值不够分，剩余区间留空
+		}
+		lo := int64(cur)
+		next := cur + width
+		hi := maxKey
+		if next <= maxU && i < count-1 {
+			hi = int64(next - 1)
+		}
+		ranges = append(ranges, BlockRange{Lo: lo, Hi: hi})
+		if hi == maxKey {
+			break
+		}
+		cur = next
+	}
+	// 兜底：最后一个区间必须覆盖到最大主键，避免尾部遗漏。
+	if len(ranges) > 0 {
+		ranges[len(ranges)-1].Hi = maxKey
+	}
+	return ranges
+}
+
+// PickSampleCandidates 从候选主键中随机选出 needed 个。
+// 先去重再洗牌，候选不足时返回 false，调用方应降级为全量扫描。
+func PickSampleCandidates(candidates []int64, needed int, rng *rand.Rand) ([]int64, bool) {
+	if needed <= 0 {
+		return nil, true
+	}
+	seen := make(map[int64]bool, len(candidates))
+	unique := make([]int64, 0, len(candidates))
+	for _, k := range candidates {
+		if !seen[k] {
+			seen[k] = true
+			unique = append(unique, k)
+		}
+	}
+	if len(unique) < needed {
+		return nil, false
+	}
+	rng.Shuffle(len(unique), func(i, j int) { unique[i], unique[j] = unique[j], unique[i] })
+	return unique[:needed], true
+}
 
 // OfferReservoir 是蓄水池抽样的单步判定（纯函数，便于单测）。
 // seen 是当前已扫描行数（从 1 开始计数），key 是本次读到的主键，pool 是池子。
@@ -53,21 +119,80 @@ func ShuffleAndSplit(pool []int64, rounds, size int, rng *rand.Rand) [][]int64 {
 	return out
 }
 
-// SampleKeys 从归档表按主键流式抽样，返回按轮切分的主键清单。
+// SampleKeys 从归档表抽样，返回按轮切分的主键清单。
 // 条件模式下归档表只装命中数据，直接在归档表上抽样即可。
 func SampleKeys(ctx context.Context, db *sql.DB, table, keyCol string, rounds, size int, seed int64) ([][]int64, error) {
+	return SampleKeysWithCondition(ctx, db, table, keyCol, "", rounds, size, seed)
+}
+
+// sampleWhere 把附加过滤条件拼成 WHERE 片段。condition 由工具内部构造，可信。
+func sampleWhere(condition string) string {
+	if condition == "" {
+		return ""
+	}
+	return " WHERE (" + condition + ")"
+}
+
+// SampleKeysWithCondition 在附加过滤条件下抽样。
+// 删除续跑时传入"主键 > 上次删除位置"，只对尚未删除的部分做校验。
+func SampleKeysWithCondition(ctx context.Context, db *sql.DB, table, keyCol, condition string, rounds, size int, seed int64) ([][]int64, error) {
 	if rounds <= 0 || size <= 0 {
 		return nil, fmt.Errorf("抽样轮数和每轮条数必须为正数")
 	}
+	needed := rounds * size
+	rng := rand.New(rand.NewSource(seed))
+	where := sampleWhere(condition)
+
+	// 第一步：只读主键索引取范围，一次返回两个值，不扫描数据行。
+	var lo, hi sql.NullInt64
+	rangeSQL := fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s%s", qIdent(keyCol), qIdent(keyCol), qIdent(table), where)
+	if err := db.QueryRowContext(ctx, rangeSQL).Scan(&lo, &hi); err != nil {
+		return nil, fmt.Errorf("读取归档表主键范围失败: %w", err)
+	}
+
+	// 第二步：每个区间只取一条候选。冗余系数 3 用于对抗主键空洞。
+	var candidates []int64
+	if lo.Valid && hi.Valid {
+		// 区间数最多 10000（配置里单轮上限 10000 × 轮数上限 100 × 3 会过大，这里封顶）。
+		rangeCount := needed * 3
+		if rangeCount > 10000 {
+			rangeCount = 10000
+		}
+		for _, r := range MakeSampleRanges(lo.Int64, hi.Int64, rangeCount) {
+			extra := fmt.Sprintf("%s BETWEEN %d AND %d", qIdent(keyCol), r.Lo, r.Hi)
+			clause := extra
+			if condition != "" {
+				clause = "(" + condition + ") AND " + extra
+			}
+			q := fmt.Sprintf("SELECT %s FROM %s WHERE %s ORDER BY %s LIMIT 1",
+				qIdent(keyCol), qIdent(table), clause, qIdent(keyCol))
+			var k int64
+			if err := db.QueryRowContext(ctx, q).Scan(&k); err == nil {
+				candidates = append(candidates, k)
+			} else if err != sql.ErrNoRows {
+				return nil, fmt.Errorf("分区取点失败（区间 [%d,%d]）: %w", r.Lo, r.Hi, err)
+			}
+		}
+	}
+
+	chosen, ok := PickSampleCandidates(candidates, needed, rng)
+	if ok {
+		return ShuffleAndSplit(chosen, rounds, size, rng), nil
+	}
+	// 候选不足：小表或空洞极多，降级为原来的流式蓄水池扫描。
+	return sampleKeysByScan(ctx, db, table, keyCol, where, rounds, size, rng)
+}
+
+// sampleKeysByScan 是原全量流式扫描，仅在分区取点候选不足时使用。
+func sampleKeysByScan(ctx context.Context, db *sql.DB, table, keyCol, where string, rounds, size int, rng *rand.Rand) ([][]int64, error) {
 	capacity := rounds * size
-	q := fmt.Sprintf("SELECT %s FROM %s ORDER BY %s", qIdent(keyCol), qIdent(table), qIdent(keyCol))
+	q := fmt.Sprintf("SELECT %s FROM %s%s ORDER BY %s", qIdent(keyCol), qIdent(table), where, qIdent(keyCol))
 	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("抽样扫描主键失败: %w", err)
 	}
 	defer rows.Close()
 
-	rng := rand.New(rand.NewSource(seed))
 	var seen int64
 	pool := make([]int64, 0, capacity)
 	for rows.Next() {
@@ -81,4 +206,12 @@ func SampleKeys(ctx context.Context, db *sql.DB, table, keyCol string, rounds, s
 		return nil, err
 	}
 	return ShuffleAndSplit(pool, rounds, size, rng), nil
+}
+
+// BuildSampleWhereByKey 构造续跑校验用的归档表过滤条件：只看主键大于续跑起点的行。
+func BuildSampleWhereByKey(keyCol string, startKey int64) string {
+	if startKey <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s > %d", qIdent(keyCol), startKey)
 }

@@ -31,6 +31,12 @@ type ReviewItemResult struct {
 // BuildReviewSQL 生成完整的复查 SQL 文本。
 // sampleRounds 是逐轮抽中的主键清单；传 nil 表示未开启抽样，不输出抽样小节。
 func BuildReviewSQL(sourceTable, archiveTable, condition, keyCol string, fields []ReviewField, results []ReviewItemResult, sampleRounds [][]int64, absTol, relTol float64) string {
+	return BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, "", keyCol, fields, results, sampleRounds, absTol, relTol)
+}
+
+// BuildReviewSQLWithArchiveCondition 在附加归档表过滤条件下生成复查 SQL。
+// 删除续跑时传入"主键 > 上次删除位置"，让人工复查看到的范围与工具校验一致。
+func BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, archiveCondition, keyCol string, fields []ReviewField, results []ReviewItemResult, sampleRounds [][]int64, absTol, relTol float64) string {
 	var sb strings.Builder
 	sb.WriteString("-- 数据迁移复查 SQL\n")
 	sb.WriteString(fmt.Sprintf("-- 生成时间: %s\n", time.Now().Format("2006-01-02 15:04:05")))
@@ -53,13 +59,17 @@ func BuildReviewSQL(sourceTable, archiveTable, condition, keyCol string, fields 
 	if condition != "" {
 		srcWhere = " WHERE " + condition
 	}
+	archiveWhere := sampleWhere(archiveCondition)
+	if archiveWhere != "" {
+		sb.WriteString(fmt.Sprintf("-- 归档表校验范围: %s（续跑时排除已删部分）\n", archiveCondition))
+	}
 	sb.WriteString(fmt.Sprintf("SELECT COUNT(*) AS 源表行数 FROM %s%s;\n", qIdent(sourceTable), srcWhere))
-	sb.WriteString(fmt.Sprintf("SELECT COUNT(*) AS 归档表行数 FROM %s;\n\n", qIdent(archiveTable)))
+	sb.WriteString(fmt.Sprintf("SELECT COUNT(*) AS 归档表行数 FROM %s%s;\n\n", qIdent(archiveTable), archiveWhere))
 
 	// 核对项二：按字段类型的求和比对。
 	sb.WriteString("-- ========== 核对项 2：数值列求和（按字段类型分别判定） ==========\n")
 	for _, f := range fields {
-		sb.WriteString(buildFieldReview(f, sourceTable, archiveTable, srcWhere, absTol, relTol))
+		sb.WriteString(buildFieldReview(f, sourceTable, archiveTable, srcWhere, archiveWhere, absTol, relTol))
 		sb.WriteString("\n")
 	}
 
@@ -69,14 +79,14 @@ func BuildReviewSQL(sourceTable, archiveTable, condition, keyCol string, fields 
 		for _, f := range fields {
 			sb.WriteString(fmt.Sprintf("-- 字段 %s [%s]\n", f.Name, f.Kind))
 			sb.WriteString(fmt.Sprintf("SELECT COUNT(%s) AS 源表非空数 FROM %s%s;\n", qIdent(f.Name), qIdent(sourceTable), srcWhere))
-			sb.WriteString(fmt.Sprintf("SELECT COUNT(%s) AS 归档表非空数 FROM %s;\n\n", qIdent(f.Name), qIdent(archiveTable)))
+			sb.WriteString(fmt.Sprintf("SELECT COUNT(%s) AS 归档表非空数 FROM %s%s;\n\n", qIdent(f.Name), qIdent(archiveTable), archiveWhere))
 		}
 	}
 
 	// 核对项四：随机抽样逐字段比对。
 	if len(sampleRounds) > 0 {
 		sb.WriteString("-- ========== 核对项 4：随机抽样逐字段比对（抓行级错位，如两行数据互换） ==========\n")
-		sb.WriteString("-- 抽样方式：等概率蓄水池抽样，按行无偏；下面是抽中的主键，可回读两表全部字段人工比对。\n")
+		sb.WriteString("-- 抽样方式：主键分区随机取点（候选不足时降级为蓄水池抽样）；下面是抽中的主键，可回读两表全部字段人工比对。\n")
 		for r, keys := range sampleRounds {
 			if len(keys) == 0 {
 				continue
@@ -95,29 +105,29 @@ func BuildReviewSQL(sourceTable, archiveTable, condition, keyCol string, fields 
 }
 
 // buildFieldReview 按字段类型生成对应的复查 SQL。
-func buildFieldReview(f ReviewField, sourceTable, archiveTable, srcWhere string, absTol, relTol float64) string {
+func buildFieldReview(f ReviewField, sourceTable, archiveTable, srcWhere, archiveWhere string, absTol, relTol float64) string {
 	sumExpr := fmt.Sprintf("SUM(%s)", qIdent(f.Name))
 	switch f.Kind {
 	case NumericInteger:
 		return fmt.Sprintf("-- 字段 %s [整数] —— 零容差精确判定，两侧数值必须逐位相等，差 1 即失败\n"+
 			"SELECT %s AS 源表求和 FROM %s%s;\n"+
-			"SELECT %s AS 归档表求和 FROM %s;\n",
-			f.Name, sumExpr, qIdent(sourceTable), srcWhere, sumExpr, qIdent(archiveTable))
+			"SELECT %s AS 归档表求和 FROM %s%s;\n",
+			f.Name, sumExpr, qIdent(sourceTable), srcWhere, sumExpr, qIdent(archiveTable), archiveWhere)
 	case NumericDecimal:
 		return fmt.Sprintf("-- 字段 %s [定点小数] —— 零容差精确判定，按数值相等，末尾多余的 0 不算差异\n"+
 			"SELECT %s AS 源表求和 FROM %s%s;\n"+
-			"SELECT %s AS 归档表求和 FROM %s;\n",
-			f.Name, sumExpr, qIdent(sourceTable), srcWhere, sumExpr, qIdent(archiveTable))
+			"SELECT %s AS 归档表求和 FROM %s%s;\n",
+			f.Name, sumExpr, qIdent(sourceTable), srcWhere, sumExpr, qIdent(archiveTable), archiveWhere)
 	case NumericFloat:
 		return fmt.Sprintf("-- 字段 %s [浮点] —— 容差判定：差值绝对值 <= %g + %g × 较大绝对值\n"+
 			"SET @src_sum = (SELECT %s FROM %s%s);\n"+
-			"SET @dst_sum = (SELECT %s FROM %s);\n"+
+			"SET @dst_sum = (SELECT %s FROM %s%s);\n"+
 			"SELECT @src_sum AS 源表求和, @dst_sum AS 归档表求和,\n"+
 			"       ABS(@src_sum - @dst_sum) <= %g + %g * GREATEST(ABS(@src_sum), ABS(@dst_sum)) AS 是否在容差内;\n"+
 			"-- 返回 1 = 通过，0 = 不通过\n",
 			f.Name, absTol, relTol,
 			sumExpr, qIdent(sourceTable), srcWhere,
-			sumExpr, qIdent(archiveTable),
+			sumExpr, qIdent(archiveTable), archiveWhere,
 			absTol, relTol)
 	default:
 		return fmt.Sprintf("-- 字段 %s [%s] —— 非数值列，不生成求和比对\n", f.Name, f.Kind)

@@ -17,11 +17,36 @@ import (
 
 // Checkpoint 是一张表的搬运进度。
 type Checkpoint struct {
-	Fingerprint string `json:"fingerprint"` // 配置指纹
-	Table       string `json:"table"`
-	LastKey     int64  `json:"last_key"`   // 已完成的最后一批的最大主键
-	RowsDone    int64  `json:"rows_done"`  // 已搬运行数
-	Stage       string `json:"stage"`      // copying | copied | verified | purged
+	Fingerprint  string `json:"fingerprint"` // 配置指纹
+	Table        string `json:"table"`
+	LastKey      int64  `json:"last_key"`       // 搬运已完成的最后一批的最大主键
+	RowsDone     int64  `json:"rows_done"`      // 已搬运行数
+	PurgeLastKey int64  `json:"purge_last_key"` // 删除已完成的最后一批的最大主键（续跑起点）
+	PurgeDeleted int64  `json:"purge_deleted"`  // 删除已累计行数（含之前运行）
+	Stage        string `json:"stage"`          // copied | purging | purged
+}
+
+// PurgeProgress 从进度文件里提取删除续跑所需的起点。
+// 只有处于 purging 阶段的进度才可作为续跑依据；其他阶段一律从头开始。
+type PurgeProgress struct {
+	StartKey     int64
+	DeletedBefore int64
+	Resuming     bool
+}
+
+// JudgePurgeProgress 判断进度文件能否用于删除续跑。
+// 配置指纹不一致时拒绝续跑，避免用旧进度删新条件的数据。
+func JudgePurgeProgress(cp *Checkpoint, fingerprint string) (PurgeProgress, error) {
+	if cp == nil || cp.Stage != "purging" {
+		return PurgeProgress{}, nil
+	}
+	if cp.Fingerprint != fingerprint {
+		return PurgeProgress{}, fmt.Errorf("删除进度文件指纹 %s 与当前配置 %s 不一致；请确认后删除进度文件重新开始", cp.Fingerprint, fingerprint)
+	}
+	if cp.PurgeLastKey < 0 || cp.PurgeDeleted < 0 {
+		return PurgeProgress{}, fmt.Errorf("删除进度文件内容异常（last=%d deleted=%d），拒绝续跑", cp.PurgeLastKey, cp.PurgeDeleted)
+	}
+	return PurgeProgress{StartKey: cp.PurgeLastKey, DeletedBefore: cp.PurgeDeleted, Resuming: true}, nil
 }
 
 // ConfigFingerprint 由表名、模式、条件、批大小生成指纹。
