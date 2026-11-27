@@ -1,13 +1,16 @@
 // 轻量数据迁移归档工具入口。
 //
-// 三个动作：
+// 四个动作：
 //   - migrate：全表模式改名归档；条件模式分批搬到归档表（默认不删源）。
-//   - verify ：独立校验，产出复查 SQL（写文件 + 打控制台），只读不删。
+//   - verify ：独立校验，产出复查 SQL（写文件 + 打控制台），只读不删。抽样种子每次不同。
+//   - sample ：独立随机抽样逐字段比对，每次执行换种子，可反复执行扩大抽查面；只读不删。
 //   - purge  ：删除源数据，内部强制先校验，通过后才按已校验主键清单分批删。
 //
 // 用法：
 //   dbmigration-lite -config config.yaml -action migrate
 //   dbmigration-lite -config config.yaml -action verify
+//   dbmigration-lite -config config.yaml -action sample
+//   dbmigration-lite -config config.yaml -action sample -seed 12345   # 指定种子便于复现
 //   dbmigration-lite -config config.yaml -action purge
 package main
 
@@ -17,7 +20,23 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 )
+
+// ResolveSampleSeed 把命令行种子参数解析成实际种子。
+// requested<0 表示自动，用 auto 值（纳秒时间戳）；>=0 则用指定值，便于复现。
+func ResolveSampleSeed(requested, auto int64) int64 {
+	if requested < 0 {
+		return auto
+	}
+	return requested
+}
+
+// SampleSeedNotice 生成动作开始时的种子提示行。
+// 三个校验类动作统一打印，purge 成功路径也能从日志里留下种子便于复现。
+func SampleSeedNotice(table string, seed int64) string {
+	return fmt.Sprintf("表 %s 本次抽样种子: %d（加 -seed %d 可复现本轮抽样）", table, seed, seed)
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -28,13 +47,16 @@ func main() {
 
 func run() error {
 	configPath := flag.String("config", "config.yaml", "配置文件路径")
-	action := flag.String("action", "", "动作：migrate | verify | purge")
+	action := flag.String("action", "", "动作：migrate | verify | sample | purge")
 	onlyTable := flag.String("table", "", "只处理指定表（可选，默认处理配置里的全部表）")
+	seed := flag.Int64("seed", -1, "抽样种子（仅 sample 动作）：不指定则每次取当前时间戳，指定则固定便于复现")
 	flag.Parse()
 
-	if *action != "migrate" && *action != "verify" && *action != "purge" {
-		return fmt.Errorf("-action 必须是 migrate、verify 或 purge")
+	if *action != "migrate" && *action != "verify" && *action != "sample" && *action != "purge" {
+		return fmt.Errorf("-action 必须是 migrate、verify、sample 或 purge")
 	}
+	// -1 表示自动种子：纳秒时间戳保证连续执行也抽到不同的行。
+	sampleSeed := ResolveSampleSeed(*seed, time.Now().UnixNano())
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
 		return err
@@ -54,7 +76,7 @@ func run() error {
 	for i := range tables {
 		t := &tables[i]
 		fmt.Printf("=== 表 %s，模式 %s，动作 %s ===\n", t.Name, t.Mode, *action)
-		if err := processTable(ctx, db, cfg, t, *action); err != nil {
+		if err := processTable(ctx, db, cfg, t, *action, sampleSeed); err != nil {
 			return fmt.Errorf("表 %s 处理失败: %w", t.Name, err)
 		}
 	}
@@ -74,16 +96,20 @@ func selectTables(tables []TableCfg, only string) []TableCfg {
 	return nil
 }
 
-func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, action string) error {
+func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, action string, sampleSeed int64) error {
 	switch t.Mode {
 	case ModeFullTable:
 		switch action {
 		case "migrate":
 			return RunFullTable(ctx, db, t)
-		case "verify", "purge":
-			return fmt.Errorf("全表模式是原子改名，不需要 verify/purge 动作；请用 -action migrate")
+		case "verify", "sample", "purge":
+			return fmt.Errorf("全表模式是原子改名，不需要 verify/sample/purge 动作；请用 -action migrate")
 		}
 	case ModeConditional:
+		// 校验类动作一开始就打印种子；purge 成功路径不输出复查 SQL，靠这行留下记录。
+		if action == "verify" || action == "sample" || action == "purge" {
+			fmt.Println(SampleSeedNotice(t.Name, sampleSeed))
+		}
 		switch action {
 		case "migrate":
 			// 条件模式搬运：探测主键与列，读取进度后分批搬运。
@@ -141,10 +167,12 @@ func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, act
 		fmt.Printf("表 %s 搬运完成（源表命中 %d 行，归档表 %d 行），请执行 -action verify 复核。\n", t.Name, srcCount, archiveCount)
 		return nil
 		case "verify":
-			return DoVerify(ctx, db, cfg, t)
+			return DoVerify(ctx, db, cfg, t, sampleSeed)
+		case "sample":
+			return DoSample(ctx, db, cfg, t, sampleSeed)
 		case "purge":
-			return RunPurge(ctx, db, cfg, t)
+			return RunPurge(ctx, db, cfg, t, sampleSeed)
 		}
 	}
-	return fmt.Errorf("未知的模式或动作组合: mode=%s action=%s", t.Mode, action)
+	return fmt.Errorf("未知的模式或动作组合: mode=%s action=%s（sample 仅支持 conditional 模式）", t.Mode, action)
 }

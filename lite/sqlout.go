@@ -28,15 +28,24 @@ type ReviewItemResult struct {
 	Detail string // 判定说明
 }
 
+// sampleSeedNote 生成抽样种子说明行；未开启抽样时不输出。
+// 记录种子是为了能用 -seed 复现本次抽中的行。
+func sampleSeedNote(sampleRounds [][]int64, seed int64) string {
+	if len(sampleRounds) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("-- 抽样种子: %d（加 -seed %d 可复现本轮抽样）\n", seed, seed)
+}
+
 // BuildReviewSQL 生成完整的复查 SQL 文本。
 // sampleRounds 是逐轮抽中的主键清单；传 nil 表示未开启抽样，不输出抽样小节。
-func BuildReviewSQL(sourceTable, archiveTable, condition, keyCol string, fields []ReviewField, results []ReviewItemResult, sampleRounds [][]int64, absTol, relTol float64) string {
-	return BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, "", keyCol, fields, results, sampleRounds, absTol, relTol)
+func BuildReviewSQL(sourceTable, archiveTable, condition, keyCol string, fields []ReviewField, results []ReviewItemResult, sampleRounds [][]int64, seed int64, absTol, relTol float64) string {
+	return BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, "", keyCol, fields, results, sampleRounds, seed, absTol, relTol)
 }
 
 // BuildReviewSQLWithArchiveCondition 在附加归档表过滤条件下生成复查 SQL。
 // 删除续跑时传入"主键 > 上次删除位置"，让人工复查看到的范围与工具校验一致。
-func BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, archiveCondition, keyCol string, fields []ReviewField, results []ReviewItemResult, sampleRounds [][]int64, absTol, relTol float64) string {
+func BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, archiveCondition, keyCol string, fields []ReviewField, results []ReviewItemResult, sampleRounds [][]int64, seed int64, absTol, relTol float64) string {
 	var sb strings.Builder
 	sb.WriteString("-- 数据迁移复查 SQL\n")
 	sb.WriteString(fmt.Sprintf("-- 生成时间: %s\n", time.Now().Format("2006-01-02 15:04:05")))
@@ -44,6 +53,7 @@ func BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, ar
 	if condition != "" {
 		sb.WriteString(fmt.Sprintf("-- 迁移条件: %s\n", condition))
 	}
+	sb.WriteString(sampleSeedNote(sampleRounds, seed))
 	sb.WriteString("-- 说明: 每项都给出可直接执行的 SQL，并在注释里标注工具自己的判定，供人工对照。\n\n")
 
 	// 工具判定汇总放最前面，便于先看结论再看 SQL。
@@ -104,6 +114,42 @@ func BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, ar
 	return sb.String()
 }
 
+// BuildSampleReviewSQL 生成独立抽样动作的复查 SQL：只含抽样小节，不夹带记录数/求和等项。
+// 头部标注种子，抽中的主键附两表回读语句，便于人工对照和复现。
+func BuildSampleReviewSQL(sourceTable, archiveTable, condition, keyCol string, results []ReviewItemResult, sampleRounds [][]int64, seed int64, absTol, relTol float64) string {
+	var sb strings.Builder
+	sb.WriteString("-- 独立抽样核对复查 SQL\n")
+	sb.WriteString(fmt.Sprintf("-- 生成时间: %s\n", time.Now().Format("2006-01-02 15:04:05")))
+	sb.WriteString(fmt.Sprintf("-- 源表: %s    归档表: %s\n", sourceTable, archiveTable))
+	if condition != "" {
+		sb.WriteString(fmt.Sprintf("-- 迁移条件: %s\n", condition))
+	}
+	sb.WriteString(fmt.Sprintf("-- 抽样种子: %d（加 -seed %d 可复现本轮抽样）\n", seed, seed))
+	sb.WriteString("-- 说明: 每项给出可直接执行的 SQL，注释里是工具判定，供人工对照。\n\n")
+
+	sb.WriteString("-- ========== 工具判定汇总 ==========\n")
+	for _, r := range results {
+		sb.WriteString(fmt.Sprintf("-- [%s] %s：%s\n", r.Verdict, r.Label, r.Detail))
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("-- ========== 核对项：随机抽样逐字段比对（抓行级错位） ==========\n")
+	sb.WriteString("-- 抽样方式：主键分区随机取点（候选不足时降级为蓄水池抽样）；下面是抽中的主键，可回读两表全部字段人工比对。\n")
+	for r, keys := range sampleRounds {
+		if len(keys) == 0 {
+			continue
+		}
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("%d", k))
+		}
+		sb.WriteString(fmt.Sprintf("-- 第 %d 轮抽中 %d 行\n", r+1, len(keys)))
+		sb.WriteString(fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s) ORDER BY %s;   -- 源表\n", qIdent(sourceTable), qIdent(keyCol), strings.Join(parts, ","), qIdent(keyCol)))
+		sb.WriteString(fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s) ORDER BY %s;   -- 归档表\n\n", qIdent(archiveTable), qIdent(keyCol), strings.Join(parts, ","), qIdent(keyCol)))
+	}
+	return sb.String()
+}
+
 // buildFieldReview 按字段类型生成对应的复查 SQL。
 func buildFieldReview(f ReviewField, sourceTable, archiveTable, srcWhere, archiveWhere string, absTol, relTol float64) string {
 	sumExpr := fmt.Sprintf("SUM(%s)", qIdent(f.Name))
@@ -136,15 +182,24 @@ func buildFieldReview(f ReviewField, sourceTable, archiveTable, srcWhere, archiv
 
 // OutputReviewSQL 把复查 SQL 同时写入文件并打印到控制台，两处内容完全一致。
 func OutputReviewSQL(outputDir, sourceTable string, sqlText string) (string, error) {
+	return outputSQL(outputDir, fmt.Sprintf("review_%s_%s.sql", sourceTable, time.Now().Format("20060102_150405")), sqlText)
+}
+
+// OutputSampleSQL 输出独立抽样动作的复查 SQL，文件名带种子，
+// 避免同一秒内反复执行时互相覆盖。
+func OutputSampleSQL(outputDir, sourceTable string, seed int64, sqlText string) (string, error) {
+	return outputSQL(outputDir, fmt.Sprintf("sample_%s_seed%d_%s.sql", sourceTable, seed, time.Now().Format("20060102_150405")), sqlText)
+}
+
+// outputSQL 写文件并原样打印到控制台，两处内容完全一致。
+func outputSQL(outputDir, name, sqlText string) (string, error) {
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return "", fmt.Errorf("创建输出目录失败: %w", err)
 	}
-	stamp := time.Now().Format("20060102_150405")
-	path := filepath.Join(outputDir, fmt.Sprintf("review_%s_%s.sql", sourceTable, stamp))
+	path := filepath.Join(outputDir, name)
 	if err := os.WriteFile(path, []byte(sqlText), 0644); err != nil {
 		return "", fmt.Errorf("写复查 SQL 文件失败: %w", err)
 	}
-	// 控制台原样输出，与文件内容一致。
 	fmt.Println(sqlText)
 	fmt.Printf("复查 SQL 已保存到: %s\n", path)
 	return path, nil

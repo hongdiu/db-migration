@@ -17,7 +17,7 @@ func TestBuildReviewSQLByType(t *testing.T) {
 	results := []ReviewItemResult{
 		{Label: "记录数", Verdict: "通过", Detail: "两侧均为 1000 行"},
 	}
-	sql := BuildReviewSQL("orders", "orders_archive", "created_at < '2024-01-01'", "id", fields, results, nil, 0.0001, 0.00001)
+	sql := BuildReviewSQL("orders", "orders_archive", "created_at < '2024-01-01'", "id", fields, results, nil, 12345, 0.0001, 0.00001)
 
 	// 整数列：零容差字样。
 	if !strings.Contains(sql, "字段 amount [定点小数] —— 零容差精确判定") {
@@ -56,7 +56,7 @@ func TestBuildReviewSQLByType(t *testing.T) {
 
 func TestBuildReviewSQLFullTable(t *testing.T) {
 	// 全表模式没有条件，两侧都不应带 WHERE。
-	sql := BuildReviewSQL("logs", "logs_archive", "", "id", nil, nil, nil, 0.0001, 0.00001)
+	sql := BuildReviewSQL("logs", "logs_archive", "", "id", nil, nil, nil, 12345, 0.0001, 0.00001)
 	if strings.Contains(sql, " WHERE ") {
 		t.Fatalf("全表模式复查 SQL 不应有 WHERE: %s", sql)
 	}
@@ -67,7 +67,7 @@ func TestBuildReviewSQLFullTable(t *testing.T) {
 
 func TestBuildReviewSQLSampleSection(t *testing.T) {
 	rounds := [][]int64{{1, 3, 5}, {7, 9}}
-	sql := BuildReviewSQL("orders", "orders_archive", "created_at < '2024-01-01'", "id", nil, nil, rounds, 0.0001, 0.00001)
+	sql := BuildReviewSQL("orders", "orders_archive", "created_at < '2024-01-01'", "id", nil, nil, rounds, 12345, 0.0001, 0.00001)
 	if !strings.Contains(sql, "核对项 4：随机抽样逐字段比对") {
 		t.Fatal("应包含抽样小节")
 	}
@@ -81,9 +81,51 @@ func TestBuildReviewSQLSampleSection(t *testing.T) {
 		t.Fatal("每轮都应有源表和归档表的回读 SQL")
 	}
 	// 未开启抽样时不应有抽样小节。
-	sql2 := BuildReviewSQL("orders", "orders_archive", "", "id", nil, nil, nil, 0.0001, 0.00001)
+	sql2 := BuildReviewSQL("orders", "orders_archive", "", "id", nil, nil, nil, 12345, 0.0001, 0.00001)
 	if strings.Contains(sql2, "核对项 4") {
 		t.Fatal("未开启抽样不应输出抽样小节")
+	}
+}
+
+func TestReviewSQLRecordsSampleSeed(t *testing.T) {
+	rounds := [][]int64{{1, 3, 5}}
+	sql := BuildReviewSQL("orders", "orders_archive", "", "id", nil, nil, rounds, 987654, 0.0001, 0.00001)
+	if !strings.Contains(sql, "抽样种子: 987654") || !strings.Contains(sql, "-seed 987654") {
+		t.Fatalf("有抽样时应标注种子及复现参数: %s", sql)
+	}
+	// 未开启抽样时不写种子行。
+	sql2 := BuildReviewSQL("orders", "orders_archive", "", "id", nil, nil, nil, 987654, 0.0001, 0.00001)
+	if strings.Contains(sql2, "抽样种子") {
+		t.Fatal("未开启抽样不应标注种子")
+	}
+}
+
+func TestBuildSampleReviewSQL(t *testing.T) {
+	rounds := [][]int64{{11, 22}, {33}}
+	results := []ReviewItemResult{{Label: "抽样第1轮逐字段比对（2行）", Verdict: "通过", Detail: "2 行全部字段一致"}}
+	sql := BuildSampleReviewSQL("orders", "orders_archive", "created_at < '2024-01-01'", "id", results, rounds, 4242, 0.0001, 0.00001)
+	for _, want := range []string{"独立抽样核对复查 SQL", "抽样种子: 4242", "[通过] 抽样第1轮", "第 1 轮抽中 2 行", "WHERE `id` IN (11,22)", "WHERE `id` IN (33)"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("抽样复查 SQL 缺少 %q: %s", want, sql)
+		}
+	}
+	// 只含抽样，不夹带记录数/求和小节。
+	if strings.Contains(sql, "核对项 1：记录数") || strings.Contains(sql, "核对项 2：数值列求和") {
+		t.Fatal("独立抽样复查 SQL 不应夹带记录数/求和项")
+	}
+}
+
+func TestOutputSampleSQLNameHasSeed(t *testing.T) {
+	dir := t.TempDir()
+	path, err := OutputSampleSQL(dir, "orders", 4242, "SELECT 1;\n")
+	if err != nil {
+		t.Fatalf("输出失败: %v", err)
+	}
+	if !strings.Contains(filepath.Base(path), "seed4242") {
+		t.Fatalf("文件名应带种子: %s", path)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("文件未生成: %v", err)
 	}
 }
 

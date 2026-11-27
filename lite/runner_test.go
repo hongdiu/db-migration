@@ -96,7 +96,7 @@ func TestReviewSQLWithArchiveCondition(t *testing.T) {
 	results := []ReviewItemResult{{Label: "记录数", Verdict: "通过", Detail: "两侧均为 10 行"}}
 
 	limited := BuildReviewSQLWithArchiveCondition("orders", "orders_archive", "created_at < '2024-01-01'",
-		"`id` > 5000", "id", fields, results, nil, 0.0001, 0.00001)
+		"`id` > 5000", "id", fields, results, nil, 12345, 0.0001, 0.00001)
 	if !strings.Contains(limited, "归档表校验范围") {
 		t.Fatalf("续跑复查 SQL 应注明范围: %s", limited)
 	}
@@ -111,7 +111,7 @@ func TestReviewSQLWithArchiveCondition(t *testing.T) {
 	}
 
 	// 全量校验时不应出现范围限制，保持原有输出不变。
-	plain := BuildReviewSQL("orders", "orders_archive", "", "id", fields, results, nil, 0.0001, 0.00001)
+	plain := BuildReviewSQL("orders", "orders_archive", "", "id", fields, results, nil, 12345, 0.0001, 0.00001)
 	if strings.Contains(plain, "`id` >") || strings.Contains(plain, "归档表校验范围") {
 		t.Fatalf("全量复查 SQL 不应带续跑范围: %s", plain)
 	}

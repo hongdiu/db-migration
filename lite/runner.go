@@ -38,17 +38,19 @@ type VerifyOutcome struct {
 	SampleRounds     [][]int64 // 抽中的主键（按轮），用于复查 SQL 输出
 	KeyCol           string    // 探测到的真实主键列名
 	ArchiveCondition string    // 归档表附加过滤条件（续跑时排除已删部分）
+	Seed             int64     // 本次抽样种子，写入复查 SQL 便于复现
 }
 
 // RunVerify 执行全量校验（只读），verify 动作使用。
-func RunVerify(ctx context.Context, db *sql.DB, t *TableCfg) (*VerifyOutcome, error) {
-	return RunVerifyRange(ctx, db, t, 0)
+// seed 决定抽样种子：每次执行传不同值即可扩大抽查面，复查 SQL 会记录该种子便于复现。
+func RunVerify(ctx context.Context, db *sql.DB, t *TableCfg, seed int64) (*VerifyOutcome, error) {
+	return RunVerifyRange(ctx, db, t, 0, seed)
 }
 
 // RunVerifyRange 校验归档表中主键大于 startKey 的部分与源表剩余数据是否一致。
 // 删除续跑时传入上次删除到的主键，避免把已经删掉的部分算进校验。
 // verify 和 purge 共用本函数，保证人工核对与删除门禁用的是同一套判定。
-func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey int64) (*VerifyOutcome, error) {
+func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey, seed int64) (*VerifyOutcome, error) {
 	// 主键探测（分块与删除门禁都依赖整型主键）。
 	pk, err := probePrimaryKey(ctx, db, t.Name)
 	if err != nil {
@@ -131,8 +133,8 @@ func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey int64
 	// 5. 随机抽样逐字段比对：抓求和/计数发现不了的行级错位。
 	var sampleRounds [][]int64
 	if t.Verify.SampleEnabled() {
-		// 抽样种子固定为 0，保证同一批数据每次校验抽到相同的行，便于复现和人工核对。
-		sampled, err := SampleKeysWithCondition(ctx, db, t.ArchiveTable, keyCol, archiveCond, t.Verify.Rounds(), t.Verify.PerRound(), 0)
+		// 种子由调用方传入：verify/purge 每次执行用不同种子，复查 SQL 记录种子便于复现。
+		sampled, err := SampleKeysWithCondition(ctx, db, t.ArchiveTable, keyCol, archiveCond, t.Verify.Rounds(), t.Verify.PerRound(), seed)
 		if err != nil {
 			return nil, err
 		}
@@ -160,18 +162,76 @@ func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey int64
 		}
 	}
 
-	return &VerifyOutcome{Results: results, Fields: fields, SampleRounds: sampleRounds, KeyCol: keyCol, ArchiveCondition: archiveCond}, nil
+	return &VerifyOutcome{Results: results, Fields: fields, SampleRounds: sampleRounds, KeyCol: keyCol, ArchiveCondition: archiveCond, Seed: seed}, nil
+}
+
+// DoSample 执行独立抽样动作：用传入种子抽一批主键，逐字段比对两表，出复查 SQL。
+// 与 verify 里的抽样共用底层函数，但种子由调用方决定（默认每次不同），
+// 可反复执行以扩大抽查面；verify 里的固定种子抽样不受影响。
+func DoSample(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed int64) error {
+	// 探测主键与列：抽样比对依赖整型单列主键和两侧字段类型。
+	pk, err := probePrimaryKey(ctx, db, t.Name)
+	if err != nil {
+		return err
+	}
+	keyCol, err := judgePrimaryKeyUsable(t.KeyColumn, pk)
+	if err != nil {
+		return err
+	}
+
+	rounds := t.Verify.Rounds()
+	size := t.Verify.PerRound()
+	if !t.Verify.SampleEnabled() {
+		return fmt.Errorf("抽样未开启：verify.sample_rounds 与 verify.sample_size 都必须大于 0")
+	}
+	sampled, err := SampleKeys(ctx, db, t.ArchiveTable, keyCol, rounds, size, seed)
+	if err != nil {
+		return err
+	}
+	cols, kinds, err := sampleColumns(ctx, db, t.Name)
+	if err != nil {
+		return err
+	}
+
+	results := make([]CheckResult, 0, len(sampled))
+	for r, keys := range sampled {
+		verdict, err := CompareSampleRound(ctx, db, t.Name, t.ArchiveTable, keyCol, cols, kinds, keys, t.Verify.AbsTolerance, t.Verify.RelTolerance)
+		if err != nil {
+			return err
+		}
+		verdict.Round = r + 1
+		cr := CheckResult{Label: fmt.Sprintf("抽样第%d轮逐字段比对（%d行）", verdict.Round, verdict.Sampled), Pass: verdict.Pass}
+		if verdict.Pass {
+			cr.Detail = fmt.Sprintf("%d 行全部字段一致", verdict.Sampled)
+		} else {
+			cr.Detail = fmt.Sprintf("%d 行中发现 %d 处字段差异", verdict.Sampled, len(verdict.Diffs))
+			for _, d := range verdict.Diffs {
+				cr.Detail += fmt.Sprintf("\n    主键%d 字段%s：源=%s 目标=%s（%s）", d.Key, d.Column, d.Src, d.Dst, d.Reason)
+			}
+		}
+		results = append(results, cr)
+	}
+
+	sqlText := BuildSampleReviewSQL(t.Name, t.ArchiveTable, t.Condition, keyCol, ResultsToReviewItems(results), sampled, seed, t.Verify.AbsTolerance, t.Verify.RelTolerance)
+	if _, err := OutputSampleSQL(cfg.Output.Dir, t.Name, seed, sqlText); err != nil {
+		return err
+	}
+	if !AllPassed(results) {
+		return fmt.Errorf("抽样核对未通过，请在上面的复查 SQL 中对照判定为[不通过]的轮次排查；源表未做任何改动")
+	}
+	fmt.Printf("表 %s 抽样核对全部通过（%d 轮 × 每轮 %d 行，种子 %d）。\n", t.Name, rounds, size, seed)
+	return nil
 }
 
 // DoVerify 执行校验动作：跑校验 + 出复查 SQL（文件 + 控制台）。
-func DoVerify(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg) error {
-	outcome, err := RunVerify(ctx, db, t)
+func DoVerify(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed int64) error {
+	outcome, err := RunVerify(ctx, db, t, seed)
 	if err != nil {
 		return err
 	}
 	results := outcome.Results
 	sqlText := BuildReviewSQLWithArchiveCondition(t.Name, t.ArchiveTable, t.Condition, outcome.ArchiveCondition, outcome.KeyCol, outcome.Fields,
-		ResultsToReviewItems(results), outcome.SampleRounds, t.Verify.AbsTolerance, t.Verify.RelTolerance)
+		ResultsToReviewItems(results), outcome.SampleRounds, outcome.Seed, t.Verify.AbsTolerance, t.Verify.RelTolerance)
 	if _, err := OutputReviewSQL(cfg.Output.Dir, t.Name, sqlText); err != nil {
 		return err
 	}
@@ -202,7 +262,7 @@ func hasNewWrites(ctx context.Context, db *sql.DB, table, condition, keyCol stri
 
 // RunPurge 执行删除动作：强制先校验，全部通过才按已校验主键清单分批删。
 // 支持中途中断后从进度文件续删；每批只按实际删除行数递减计数，不再重复全表统计。
-func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg) error {
+func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed int64) error {
 	fingerprint := ConfigFingerprint(*t)
 	cp, err := LoadCheckpoint(cfg.Checkpoint.Dir, t.Name)
 	if err != nil {
@@ -223,14 +283,14 @@ func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg) error {
 	}
 
 	// 删除前强制复核：续跑时只校验尚未删除的部分，已删部分不参与比对。
-	outcome, err := RunVerifyRange(ctx, db, t, startKey)
+	outcome, err := RunVerifyRange(ctx, db, t, startKey, seed)
 	if err != nil {
 		return err
 	}
 	results := outcome.Results
 	if !AllPassed(results) {
 		sqlText := BuildReviewSQLWithArchiveCondition(t.Name, t.ArchiveTable, t.Condition, outcome.ArchiveCondition, outcome.KeyCol, nil,
-			ResultsToReviewItems(results), outcome.SampleRounds, t.Verify.AbsTolerance, t.Verify.RelTolerance)
+			ResultsToReviewItems(results), outcome.SampleRounds, outcome.Seed, t.Verify.AbsTolerance, t.Verify.RelTolerance)
 		_, _ = OutputReviewSQL(cfg.Output.Dir, t.Name, sqlText)
 		return fmt.Errorf("删除前校验未通过，已停止；源表未做任何改动，请按复查 SQL 排查")
 	}
