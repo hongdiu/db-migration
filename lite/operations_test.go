@@ -27,6 +27,38 @@ func TestBuildCopyQuery(t *testing.T) {
 	}
 }
 
+func TestBuildNonPositiveKeyCheckQuery(t *testing.T) {
+	q := BuildNonPositiveKeyCheckQuery("orders", "created_at < '2024-01-01'", "id")
+	if !strings.Contains(q, "`id` <= 0") {
+		t.Fatalf("应检查主键小于等于 0: %s", q)
+	}
+	if !strings.Contains(q, "(created_at < '2024-01-01') AND") {
+		t.Fatalf("应带迁移条件: %s", q)
+	}
+	if !strings.Contains(q, "LIMIT 1") {
+		t.Fatalf("命中任一行即可，应限制为 1 行: %s", q)
+	}
+	q2 := BuildNonPositiveKeyCheckQuery("logs", "", "id")
+	if strings.Contains(q2, "() AND") || !strings.Contains(q2, "`id` <= 0") {
+		t.Fatalf("无条件时不应有空括号，且仍要检查主键: %s", q2)
+	}
+}
+
+func TestJudgeNonPositiveKey(t *testing.T) {
+	if err := JudgeNonPositiveKey(false, "orders", "id"); err != nil {
+		t.Fatalf("没有非正主键时应放行: %v", err)
+	}
+	err := JudgeNonPositiveKey(true, "orders", "id")
+	if err == nil {
+		t.Fatal("查到非正主键时必须拒绝")
+	}
+	for _, want := range []string{"orders", "id", "小于等于 0", "静默漏数据", "-force"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("报错应包含 %q，实际：%s", want, err.Error())
+		}
+	}
+}
+
 func TestJudgePurgeAllowed(t *testing.T) {
 	cases := []struct {
 		name    string

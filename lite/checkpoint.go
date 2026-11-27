@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Checkpoint 是一张表的搬运进度。
@@ -102,6 +103,94 @@ func JudgePendingPurge(cp *Checkpoint, remaining int64) (PurgeRecovery, error) {
 			"可能有外部写入或删除夹在中间。请人工核对该区间后，把进度文件里的 purge_last_key/purge_deleted 改成实际值，再重跑",
 			cp.PurgePendingFrom, cp.PurgePendingTo, cp.PurgePendingRows, remaining)
 	}
+}
+
+// -force 放行的三类场景。用中文写进审计文件，运维翻看时不用猜缩写。
+const (
+	ForceSceneUniqueIndex      = "条件模式-不含主键列的唯一索引"
+	ForceSceneRenameSideEffect = "全表模式-改名副作用"
+	ForceScenePurgeSampling    = "删除-抽样关闭"
+)
+
+// ForceRecord 是一条 -force 放行审计，只记录事实，不参与任何放行判定。
+type ForceRecord struct {
+	Scene       string `json:"scene"`       // 放行场景
+	Fingerprint string `json:"fingerprint"` // 当时的配置指纹
+	At          string `json:"at"`          // RFC3339 时间
+}
+
+// forceAuditPath 返回审计文件路径。与进度文件同目录但单独存放，
+// 避免每次写进度时把历史放行记录冲掉。
+func forceAuditPath(dir, table string) string {
+	return filepath.Join(dir, fmt.Sprintf("force_%s.json", table))
+}
+
+// RecordForce 追加一条 -force 放行审计。
+// 注意：这里只留痕，不会让后续执行自动放行——危险操作每次都要显式加 -force。
+func RecordForce(dir, table, scene, fingerprint string, at time.Time) error {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("创建审计目录失败: %w", err)
+	}
+	path := forceAuditPath(dir, table)
+	var records []ForceRecord
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if err := json.Unmarshal(data, &records); err != nil {
+			return fmt.Errorf("解析 -force 审计文件失败: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("读取 -force 审计文件失败: %w", err)
+	}
+	records = append(records, ForceRecord{Scene: scene, Fingerprint: fingerprint, At: at.Format(time.RFC3339)})
+	out, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		return fmt.Errorf("序列化 -force 审计失败: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0600); err != nil {
+		return fmt.Errorf("写临时审计文件失败: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("提交审计文件失败: %w", err)
+	}
+	return nil
+}
+
+// LoadForceAudit 读取审计记录；文件不存在返回 nil, nil。
+func LoadForceAudit(dir, table string) ([]ForceRecord, error) {
+	data, err := os.ReadFile(forceAuditPath(dir, table))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("读取 -force 审计文件失败: %w", err)
+	}
+	var records []ForceRecord
+	if err := json.Unmarshal(data, &records); err != nil {
+		return nil, fmt.Errorf("解析 -force 审计文件失败: %w", err)
+	}
+	return records, nil
+}
+
+// ForceAuditNotice 生成"此前曾放行"的提示。只陈述事实，明确授权不会自动沿用。
+func ForceAuditNotice(records []ForceRecord, scene, fingerprint string) string {
+	for i := len(records) - 1; i >= 0; i-- {
+		r := records[i]
+		if r.Scene == scene && r.Fingerprint == fingerprint {
+			return fmt.Sprintf("提示: 该场景此前于 %s 以 -force 放行过（配置指纹 %s）。授权不会自动沿用，本次仍需显式加 -force。", r.At, fingerprint)
+		}
+	}
+	return ""
+}
+
+// ForceAuditNoticeFrom 读取审计文件并生成提示；无记录返回空串。
+// 审计提示只是辅助信息，读取失败时不阻断主流程。
+func ForceAuditNoticeFrom(dir, table, scene, fingerprint string) string {
+	records, err := LoadForceAudit(dir, table)
+	if err != nil || len(records) == 0 {
+		return ""
+	}
+	return ForceAuditNotice(records, scene, fingerprint)
 }
 
 // ConfigFingerprint 由表名、模式、条件、批大小生成指纹。

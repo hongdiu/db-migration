@@ -97,7 +97,7 @@ func BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, ar
 	// 核对项四：随机抽样逐字段比对。
 	if len(sampleRounds) > 0 {
 		sb.WriteString("-- ========== 核对项 4：随机抽样逐字段比对（抓行级错位，如两行数据互换） ==========\n")
-		sb.WriteString("-- 抽样方式：主键分区随机取点（候选不足时降级为蓄水池抽样）；下面是抽中的主键，可回读两表全部字段人工比对。\n")
+		sb.WriteString("-- 抽样方式：主键分区随机取点（候选不足时降级为蓄水池抽样）；下面是抽中的主键，可回读两表所有可比对列（生成列除外）人工比对。\n")
 		for r, keys := range sampleRounds {
 			if len(keys) == 0 {
 				continue
@@ -107,7 +107,7 @@ func BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, ar
 				parts = append(parts, fmt.Sprintf("%d", k))
 			}
 			sb.WriteString(fmt.Sprintf("-- 第 %d 轮抽中 %d 行\n", r+1, len(keys)))
-			// 给出按主键回读两表全部字段的 SQL，用户可直接贴到客户端对照。
+			// 给出按主键回读两表所有可比对列（生成列除外）的 SQL，用户可直接贴到客户端对照。
 			sb.WriteString(fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s) ORDER BY %s;   -- 源表\n", qIdent(sourceTable), qIdent(keyCol), strings.Join(parts, ","), qIdent(keyCol)))
 			sb.WriteString(fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s) ORDER BY %s;   -- 归档表\n\n", qIdent(archiveTable), qIdent(keyCol), strings.Join(parts, ","), qIdent(keyCol)))
 		}
@@ -118,12 +118,21 @@ func BuildReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, ar
 // BuildSampleReviewSQL 生成独立抽样动作的复查 SQL：只含抽样小节，不夹带记录数/求和等项。
 // 头部标注种子，抽中的主键附两表回读语句，便于人工对照和复现。
 func BuildSampleReviewSQL(sourceTable, archiveTable, condition, keyCol string, results []ReviewItemResult, sampleRounds [][]int64, seed int64, tols Tolerances) string {
+	return BuildSampleReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, "", keyCol, results, sampleRounds, seed, tols)
+}
+
+// BuildSampleReviewSQLWithArchiveCondition 在附加归档表过滤条件下生成独立抽样复查 SQL。
+// 删除续跑时传入"主键 > 上次删除位置"，把人工复查的范围也限定在尚未删除的部分。
+func BuildSampleReviewSQLWithArchiveCondition(sourceTable, archiveTable, condition, archiveCondition, keyCol string, results []ReviewItemResult, sampleRounds [][]int64, seed int64, tols Tolerances) string {
 	var sb strings.Builder
 	sb.WriteString("-- 独立抽样核对复查 SQL\n")
 	sb.WriteString(fmt.Sprintf("-- 生成时间: %s\n", time.Now().Format("2006-01-02 15:04:05")))
 	sb.WriteString(fmt.Sprintf("-- 源表: %s    归档表: %s\n", sourceTable, archiveTable))
 	if condition != "" {
 		sb.WriteString(fmt.Sprintf("-- 迁移条件: %s\n", condition))
+	}
+	if archiveCondition != "" {
+		sb.WriteString(fmt.Sprintf("-- 归档表抽样范围: %s（续跑时排除已删部分）\n", archiveCondition))
 	}
 	sb.WriteString(fmt.Sprintf("-- 抽样种子: %d（加 -seed %d 可复现本轮抽样）\n", seed, seed))
 	sb.WriteString("-- 说明: 每项给出可直接执行的 SQL，注释里是工具判定，供人工对照。\n\n")
@@ -135,7 +144,11 @@ func BuildSampleReviewSQL(sourceTable, archiveTable, condition, keyCol string, r
 	sb.WriteString("\n")
 
 	sb.WriteString("-- ========== 核对项：随机抽样逐字段比对（抓行级错位） ==========\n")
-	sb.WriteString("-- 抽样方式：主键分区随机取点（候选不足时降级为蓄水池抽样）；下面是抽中的主键，可回读两表全部字段人工比对。\n")
+	sb.WriteString("-- 抽样方式：主键分区随机取点（候选不足时降级为蓄水池抽样）；下面是抽中的主键，可回读两表所有可比对列（生成列除外）人工比对。\n")
+	archiveExtra := ""
+	if archiveCondition != "" {
+		archiveExtra = " AND (" + archiveCondition + ")"
+	}
 	for r, keys := range sampleRounds {
 		if len(keys) == 0 {
 			continue
@@ -146,7 +159,7 @@ func BuildSampleReviewSQL(sourceTable, archiveTable, condition, keyCol string, r
 		}
 		sb.WriteString(fmt.Sprintf("-- 第 %d 轮抽中 %d 行\n", r+1, len(keys)))
 		sb.WriteString(fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s) ORDER BY %s;   -- 源表\n", qIdent(sourceTable), qIdent(keyCol), strings.Join(parts, ","), qIdent(keyCol)))
-		sb.WriteString(fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s) ORDER BY %s;   -- 归档表\n\n", qIdent(archiveTable), qIdent(keyCol), strings.Join(parts, ","), qIdent(keyCol)))
+		sb.WriteString(fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s)%s ORDER BY %s;   -- 归档表\n\n", qIdent(archiveTable), qIdent(keyCol), strings.Join(parts, ","), archiveExtra, qIdent(keyCol)))
 	}
 	return sb.String()
 }

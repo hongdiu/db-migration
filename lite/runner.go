@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
+	"time"
 )
 
 // buildReviewFields 从表元数据中找出配置了数值校验的列及其类型。
@@ -174,12 +176,10 @@ func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey, seed
 			verdict.Round = r + 1
 			cr := CheckResult{Label: fmt.Sprintf("抽样第%d轮逐字段比对（%d行）", verdict.Round, verdict.Sampled), Pass: verdict.Pass}
 			if verdict.Pass {
-				cr.Detail = fmt.Sprintf("%d 行全部字段一致", verdict.Sampled)
+				cr.Detail = fmt.Sprintf("%d 行所有可比对列一致（生成列除外）", verdict.Sampled)
 			} else {
-				cr.Detail = fmt.Sprintf("%d 行中发现 %d 处字段差异", verdict.Sampled, len(verdict.Diffs))
-				for _, d := range verdict.Diffs {
-					cr.Detail += fmt.Sprintf("\n    主键%d 字段%s：源=%s 目标=%s（%s）", d.Key, d.Column, d.Src, d.Dst, d.Reason)
-				}
+				cr.Detail = fmt.Sprintf("%d 行中发现 %d 处差异", verdict.Sampled, len(verdict.Diffs))
+				cr.Detail += formatSampleDiffs(verdict.Diffs)
 			}
 			results = append(results, cr)
 		}
@@ -202,13 +202,32 @@ func DoSample(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 		return err
 	}
 
+	// 部分 purge 之后，已删的那批主键只留在归档表里。照旧从整个归档表抽，
+	// 会抽到源表已不存在的主键，回读时被误报成"列缺失"。按删除断点限定抽样范围。
+	cp, err := LoadCheckpoint(cfg.Checkpoint.Dir, t.Name)
+	if err != nil {
+		return err
+	}
+	if cp != nil && cp.Stage == "purged" {
+		fmt.Printf("表 %s 已标记为删除完成，源表已无数据可抽样，跳过。\n", t.Name)
+		return nil
+	}
+	startKey := int64(0)
+	if cp != nil && cp.Stage == "purging" {
+		startKey = cp.PurgeLastKey
+	}
+	archiveCond := BuildSampleWhereByKey(keyCol, startKey)
+	if startKey > 0 {
+		fmt.Printf("表 %s 已有删除进度，本次只对主键大于 %d 的部分抽样，避免抽到已删行。\n", t.Name, startKey)
+	}
+
 	rounds := t.Verify.Rounds()
 	size := t.Verify.PerRound()
 	if !t.Verify.SampleEnabled() {
 		return fmt.Errorf("抽样未开启：verify.sample_rounds 与 verify.sample_size 都必须大于 0")
 	}
 	tols := t.Verify.Tolerances()
-	sampled, err := SampleKeys(ctx, db, t.ArchiveTable, keyCol, rounds, size, seed)
+	sampled, err := SampleKeysWithCondition(ctx, db, t.ArchiveTable, keyCol, archiveCond, rounds, size, seed)
 	if err != nil {
 		return err
 	}
@@ -226,17 +245,15 @@ func DoSample(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 		verdict.Round = r + 1
 		cr := CheckResult{Label: fmt.Sprintf("抽样第%d轮逐字段比对（%d行）", verdict.Round, verdict.Sampled), Pass: verdict.Pass}
 		if verdict.Pass {
-			cr.Detail = fmt.Sprintf("%d 行全部字段一致", verdict.Sampled)
+			cr.Detail = fmt.Sprintf("%d 行所有可比对列一致（生成列除外）", verdict.Sampled)
 		} else {
-			cr.Detail = fmt.Sprintf("%d 行中发现 %d 处字段差异", verdict.Sampled, len(verdict.Diffs))
-			for _, d := range verdict.Diffs {
-				cr.Detail += fmt.Sprintf("\n    主键%d 字段%s：源=%s 目标=%s（%s）", d.Key, d.Column, d.Src, d.Dst, d.Reason)
-			}
+			cr.Detail = fmt.Sprintf("%d 行中发现 %d 处差异", verdict.Sampled, len(verdict.Diffs))
+			cr.Detail += formatSampleDiffs(verdict.Diffs)
 		}
 		results = append(results, cr)
 	}
 
-	sqlText := BuildSampleReviewSQL(t.Name, t.ArchiveTable, t.Condition, keyCol, ResultsToReviewItems(results), sampled, seed, tols)
+	sqlText := BuildSampleReviewSQLWithArchiveCondition(t.Name, t.ArchiveTable, t.Condition, archiveCond, keyCol, ResultsToReviewItems(results), sampled, seed, tols)
 	if _, err := OutputSampleSQL(cfg.Output.Dir, t.Name, seed, sqlText); err != nil {
 		return err
 	}
@@ -247,13 +264,35 @@ func DoSample(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 	return nil
 }
 
+// formatSampleDiffs 把一轮抽样的差异明细拼成报告文字。
+// 整行缺失（Column 为空）和字段值不同是两类问题，文案要分开，避免把"主键已被删掉"说成"列缺失"。
+func formatSampleDiffs(diffs []RowDiff) string {
+	var sb strings.Builder
+	for _, d := range diffs {
+		if d.Column == "" {
+			sb.WriteString(fmt.Sprintf("\n    主键%d：%s", d.Key, d.Reason))
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("\n    主键%d 字段%s：源=%s 目标=%s（%s）", d.Key, d.Column, d.Src, d.Dst, d.Reason))
+	}
+	return sb.String()
+}
+
 // verifyConclusion 生成"校验通过"时的结论文案。
 // 未配置数值列时必须显式点出缺口：这类配置下金额差异只能靠记录数、分块和抽样兜底，
 // 一句笼统的"全部通过"会让人误以为数值列也核对过了。
-func verifyConclusion(table string, checkedItems, numericFields int) string {
+func verifyConclusion(table string, checkedItems, numericFields int, sampleEnabled bool) string {
+	if numericFields == 0 && !sampleEnabled {
+		return fmt.Sprintf("表 %s 校验通过（%d 项），但未配置 verify.numeric_fields 且抽样已关闭：数值列未做任何比对，"+
+			"行级错位也未做逐字段抽查，这个结论既不代表金额类数据已被核对，也不代表做过抽样。", table, checkedItems)
+	}
 	if numericFields == 0 {
 		return fmt.Sprintf("表 %s 校验通过（%d 项），但未配置 verify.numeric_fields：数值列未做任何比对，"+
 			"这个结论不代表金额类数据已被核对。", table, checkedItems)
+	}
+	if !sampleEnabled {
+		return fmt.Sprintf("表 %s 校验通过（%d 项），但抽样已关闭：未做逐字段抽查，行级错位可能漏检，"+
+			"这个结论不代表做过抽样。", table, checkedItems)
 	}
 	return fmt.Sprintf("表 %s 校验全部通过（%d 项）。", table, checkedItems)
 }
@@ -273,11 +312,10 @@ func DoVerify(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 	if !AllPassed(results) {
 		return fmt.Errorf("校验未通过，请在上面的复查 SQL 中对照工具判定为[不通过]的项目排查；源表未做任何改动")
 	}
-	if len(outcome.Fields) == 0 {
-		fmt.Println(verifyConclusion(t.Name, len(results), 0))
-		return nil
+	if !t.Verify.SampleEnabled() {
+		fmt.Println(SamplingDisabledNotice(t.Name, "verify"))
 	}
-	fmt.Println(verifyConclusion(t.Name, len(results), len(outcome.Fields)))
+	fmt.Println(verifyConclusion(t.Name, len(results), len(outcome.Fields), t.Verify.SampleEnabled()))
 	return nil
 }
 
@@ -297,6 +335,14 @@ func hasNewWrites(ctx context.Context, db *sql.DB, table, condition, keyCol stri
 		return false, err
 	}
 	return true, nil
+}
+
+// SamplingDisabledNotice 生成"抽样已关闭"的统一提示。
+// verify 与 purge 共用同一段说明，避免两处口径不一致。
+func SamplingDisabledNotice(table, action string) string {
+	return fmt.Sprintf("注意: 表 %s 本次 %s 未开启抽样（verify.sample_rounds 或 sample_size 为 0）："+
+		"行级错位（如两行数据互换）只能靠记录数、求和、最值、非空数、分块计数发现，可能漏检；"+
+		"结论不代表做过逐字段抽查。", table, action)
 }
 
 // JudgePurgeSamplingAllowed 判定是否允许在没有抽样的情况下执行删除。
@@ -347,10 +393,16 @@ func RunPurge(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, seed in
 		return nil
 	}
 	if err := JudgePurgeSamplingAllowed(t.Verify.SampleEnabled(), force); err != nil {
+		if notice := ForceAuditNoticeFrom(cfg.Checkpoint.Dir, t.Name, ForceScenePurgeSampling, fingerprint); notice != "" {
+			fmt.Println(notice)
+		}
 		return err
 	}
 	if !t.Verify.SampleEnabled() {
-		fmt.Println("警告: 抽样已关闭，行级错位只能靠记录数/求和/分块计数发现，可能漏检；已按 -force 继续。")
+		if err := RecordForce(cfg.Checkpoint.Dir, t.Name, ForceScenePurgeSampling, fingerprint, time.Now()); err != nil {
+			return err
+		}
+		fmt.Println(SamplingDisabledNotice(t.Name, "purge") + " 已按 -force 继续。")
 	}
 
 	progress, err := JudgePurgeProgress(cp, fingerprint)

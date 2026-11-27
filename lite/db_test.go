@@ -128,6 +128,30 @@ func TestUpsertConflictIndexes(t *testing.T) {
 	if got := upsertConflictIndexes([]IndexMeta{primary, sameKey}, "id"); len(got) != 0 {
 		t.Fatalf("与主键同列的唯一索引不应误报: %+v", got)
 	}
+	// 包含主键列但也带其它列：UNIQUE(id, tenant) 同样不可能撞到别的行。
+	withPK := IndexMeta{Name: "uk_id_tenant", Unique: true, Columns: []string{"id", "tenant"}}
+	if got := upsertConflictIndexes([]IndexMeta{primary, withPK}, "id"); len(got) != 0 {
+		t.Fatalf("包含主键列的唯一索引不应误报: %+v", got)
+	}
+	withPKRev := IndexMeta{Name: "uk_tenant_id", Unique: true, Columns: []string{"tenant", "ID"}}
+	if got := upsertConflictIndexes([]IndexMeta{primary, withPKRev}, "id"); len(got) != 0 {
+		t.Fatalf("列顺序与大小写不影响包含判定: %+v", got)
+	}
+	// 复合主键：包含全部主键列时豁免，只包含其中一部分时仍要拦。
+	compositePK := IndexMeta{Name: "PRIMARY", Unique: true, Columns: []string{"a", "b"}}
+	ukABC := IndexMeta{Name: "uk_abc", Unique: true, Columns: []string{"b", "c", "a"}}
+	if got := upsertConflictIndexes([]IndexMeta{compositePK, ukABC}, ""); len(got) != 0 {
+		t.Fatalf("包含全部主键列的唯一索引应豁免: %+v", got)
+	}
+	ukA := IndexMeta{Name: "uk_a", Unique: true, Columns: []string{"a"}}
+	if got := upsertConflictIndexes([]IndexMeta{compositePK, ukA}, ""); len(got) != 1 {
+		t.Fatalf("只包含部分主键列仍应报冲突: %+v", got)
+	}
+	// 没有主键列可依时，不豁免任何唯一索引。
+	ukX := IndexMeta{Name: "uk_x", Unique: true, Columns: []string{"x"}}
+	if got := upsertConflictIndexes([]IndexMeta{ukX}, ""); len(got) != 1 {
+		t.Fatalf("无主键列时不应豁免唯一索引: %+v", got)
+	}
 	// 普通索引不参与唯一性判定。
 	plain := IndexMeta{Name: "idx_order", Unique: false, Columns: []string{"order_no"}}
 	if got := upsertConflictIndexes([]IndexMeta{primary, plain}, "id"); len(got) != 0 {

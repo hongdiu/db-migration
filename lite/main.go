@@ -56,7 +56,7 @@ func run() error {
 	action := flag.String("action", "", "动作：migrate | verify | sample | purge")
 	onlyTable := flag.String("table", "", "只处理指定表（可选，默认处理配置里的全部表）")
 	seed := flag.Int64("seed", -1, "抽样种子（verify/sample/purge 通用）：不指定则每次取当前时间戳，指定则固定便于复现")
-	force := flag.Bool("force", false, "放行默认被拒绝的危险操作（条件模式源表带非主键唯一索引、全表模式源表带触发器/外键/非主键自增列、purge 关闭抽样）；仅在明确知情时使用")
+	force := flag.Bool("force", false, "放行默认被拒绝的危险操作（条件模式源表带不含主键列的唯一索引、全表模式源表带触发器/外键/非主键自增列、purge 关闭抽样）；仅在明确知情时使用。放行会记入断点目录的审计文件，续跑仍需再次显式放行")
 	flag.Parse()
 
 	if *action != "migrate" && *action != "verify" && *action != "sample" && *action != "purge" {
@@ -125,7 +125,7 @@ func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, act
 	case ModeFullTable:
 		switch action {
 		case "migrate":
-			return RunFullTable(ctx, db, t, force)
+			return RunFullTable(ctx, db, cfg, t, force)
 		case "verify", "sample", "purge":
 			return fmt.Errorf("%w: 全表模式是原子改名，没有搬运和删除，不需要 verify/sample/purge；请用 -action migrate", errActionNotApplicable)
 		}
@@ -145,20 +145,37 @@ func processTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, act
 			if err != nil {
 				return err
 			}
+			// 主键为正预检：游标从 0 开始、按 key > lastKey 推进，主键为 0 或负数的行永远搬不到。
+			// 放在建归档表之前，拒绝时不会留下一张空表。
+			nonPositive, err := hasNonPositiveKey(ctx, db, t.Name, t.Condition, keyCol)
+			if err != nil {
+				return err
+			}
+			if err := JudgeNonPositiveKey(nonPositive, t.Name, keyCol); err != nil {
+				return err
+			}
 			columns, err := insertableColumns(ctx, db, t.Name)
 			if err != nil {
 				return err
 			}
-			// 唯一索引预检：搬运用 ON DUPLICATE KEY UPDATE，它在主键以外的唯一索引冲突时
-			// 同样会触发，并且整行改写归档表里的另一行（连主键一起改）。行数与汇总校验都发现不了。
+			// 唯一索引预检：搬运用 ON DUPLICATE KEY UPDATE，它在任何唯一索引冲突时都会触发；
+			// 不含主键列的唯一索引可能让写入整行改写归档表里的另一行（连主键一起改）。
+			// 包含主键列的索引只会命中同一行，不算风险。行数与汇总校验都发现不了这类错位。
 			// 放在建归档表之前，拒绝时不会留下一张空表。
 			srcIndexes, err := tableIndexes(ctx, db, t.Name)
 			if err != nil {
 				return fmt.Errorf("读取源表索引失败: %w", err)
 			}
+			fingerprint := ConfigFingerprint(*t)
 			if idxErr := judgeUpsertUniqueIndexes(t.Name, srcIndexes, keyCol); idxErr != nil {
 				if !force {
+					if notice := ForceAuditNoticeFrom(cfg.Checkpoint.Dir, t.Name, ForceSceneUniqueIndex, fingerprint); notice != "" {
+						fmt.Println(notice)
+					}
 					return idxErr
+				}
+				if err := RecordForce(cfg.Checkpoint.Dir, t.Name, ForceSceneUniqueIndex, fingerprint, time.Now()); err != nil {
+					return err
 				}
 				fmt.Printf("警告: %v\n已按 -force 继续：若搬运期间唯一键被改值或复用，归档表会出现整行错位，且行数校验发现不了。\n", idxErr)
 			}

@@ -43,6 +43,41 @@ func BuildCopyQuery(source, archive string, columns []string, keyCol, condition 
 		qIdent(archive), colList, selectSQL, strings.Join(updates, ","))
 }
 
+// BuildNonPositiveKeyCheckQuery 生成"源表是否有主键小于等于 0 的命中行"的检查 SQL。
+// 条件模式的游标从 0 开始、每批取 key > 上一个主键，主键为 0 或负数的行永远取不到；
+// 搬运前先查一次，命中任一行就拒绝，避免静默漏数据。
+func BuildNonPositiveKeyCheckQuery(table, condition, keyCol string) string {
+	where := fmt.Sprintf("%s <= 0", qIdent(keyCol))
+	if condition != "" {
+		where = "(" + condition + ") AND " + where
+	}
+	return fmt.Sprintf("SELECT 1 FROM %s WHERE %s LIMIT 1", qIdent(table), where)
+}
+
+// JudgeNonPositiveKey 把"是否查到非正整数主键"转成判定结果：命中就报错，否则放行。
+// 独立成纯函数，便于在没有数据库的环境里覆盖判定分支与提示文案。
+func JudgeNonPositiveKey(found bool, table, keyCol string) error {
+	if !found {
+		return nil
+	}
+	return fmt.Errorf("表 %s 的主键 %s 存在小于等于 0 的值。条件模式按主键游标从 0 开始、"+
+		"逐批取 key > 上一个主键的数据，主键为 0 或负数的行永远不会被搬运，会造成静默漏数据。"+
+		"请先把这些行的主键修正为正整数，或改用全表模式；此处不能靠 -force 放行，因为漏掉的行既不会进归档表也不会被删除", table, keyCol)
+}
+
+// hasNonPositiveKey 执行非正整数主键检查，命中任一行即返回 true。
+func hasNonPositiveKey(ctx context.Context, db *sql.DB, table, condition, keyCol string) (bool, error) {
+	var one int
+	err := db.QueryRowContext(ctx, BuildNonPositiveKeyCheckQuery(table, condition, keyCol)).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("检查源表主键是否为正整数失败: %w", err)
+	}
+	return true, nil
+}
+
 // ProgressPercent 计算搬运完成百分比，截断到 0~100。
 // total<=0 表示没有命中数据，直接算作完成，避免除零。
 func ProgressPercent(done, total int64) int {
@@ -349,8 +384,9 @@ func JudgeMaxKeyForAutoIncrement(maxKey int64) error {
 }
 
 // RunFullTable 执行全表模式的预检与原子切换。
-// force 只影响"改名会让新表丢掉触发器/外键"这一类可接受副作用，其余预检照旧拒绝。
-func RunFullTable(ctx context.Context, db *sql.DB, t *TableCfg, force bool) error {
+// force 只影响"改名会让新表丢掉触发器/外键/自增计数器"这一类可接受副作用，其余预检照旧拒绝。
+// 放行会写入审计文件，但续跑仍需再次显式加 -force。
+func RunFullTable(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, force bool) error {
 	// 预检一：归档表不能已存在。
 	exists, err := tableExists(ctx, db, t.ArchiveTable)
 	if err != nil {
@@ -391,9 +427,16 @@ func RunFullTable(ctx context.Context, db *sql.DB, t *TableCfg, force bool) erro
 	if err != nil {
 		return fmt.Errorf("检查自增列失败: %w", err)
 	}
+	fingerprint := ConfigFingerprint(*t)
 	if sideErr := judgeRenameSideEffects(triggers, outFKs, autoIncCols, keyCol); sideErr != nil {
 		if !force {
+			if notice := ForceAuditNoticeFrom(cfg.Checkpoint.Dir, t.Name, ForceSceneRenameSideEffect, fingerprint); notice != "" {
+				fmt.Println(notice)
+			}
 			return sideErr
+		}
+		if err := RecordForce(cfg.Checkpoint.Dir, t.Name, ForceSceneRenameSideEffect, fingerprint, time.Now()); err != nil {
+			return err
 		}
 		fmt.Printf("警告: %v\n已按 -force 继续。请自行在新表上重建触发器与外键，并把其余自增列的计数器调到安全值。\n", sideErr)
 	}

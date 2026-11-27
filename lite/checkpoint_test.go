@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestJudgePendingPurge(t *testing.T) {
@@ -92,6 +93,53 @@ func TestJudgeCheckpointResumable(t *testing.T) {
 	}
 	if err := JudgeCheckpointResumable(nil, "bbb"); err != nil {
 		t.Fatalf("无进度文件应允许全新开始: %v", err)
+	}
+}
+
+func TestForceAuditRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	at := time.Date(2026, 11, 27, 16, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	if err := RecordForce(dir, "orders", ForceScenePurgeSampling, "fp1", at); err != nil {
+		t.Fatalf("写审计失败: %v", err)
+	}
+	records, err := LoadForceAudit(dir, "orders")
+	if err != nil || len(records) != 1 {
+		t.Fatalf("读取审计失败: %+v err=%v", records, err)
+	}
+	if records[0].Scene != ForceScenePurgeSampling || records[0].Fingerprint != "fp1" ||
+		!strings.Contains(records[0].At, "2026-11-27T16:00:00") {
+		t.Fatalf("审计内容不对: %+v", records[0])
+	}
+	// 临时文件应已改名清理。
+	if _, err := os.Stat(filepath.Join(dir, "force_orders.json.tmp")); !os.IsNotExist(err) {
+		t.Fatal("临时审计文件应被改名清理")
+	}
+	// 再次放行是追加，不是覆盖。
+	if err := RecordForce(dir, "orders", ForceSceneUniqueIndex, "fp2", at.Add(time.Hour)); err != nil {
+		t.Fatalf("追加审计失败: %v", err)
+	}
+	records, err = LoadForceAudit(dir, "orders")
+	if err != nil || len(records) != 2 {
+		t.Fatalf("应追加而非覆盖: %+v err=%v", records, err)
+	}
+	// 没有审计文件的表：返回 nil，不报错。
+	got, err := LoadForceAudit(dir, "missing")
+	if err != nil || got != nil {
+		t.Fatalf("无审计文件应返回 nil: %+v err=%v", got, err)
+	}
+}
+
+func TestForceAuditNoticeDoesNotGrant(t *testing.T) {
+	records := []ForceRecord{{Scene: ForceScenePurgeSampling, Fingerprint: "fp1", At: "2026-11-27T16:00:00+08:00"}}
+	// 同场景同指纹：给出提示，但明确说明不会自动沿用。
+	notice := ForceAuditNotice(records, ForceScenePurgeSampling, "fp1")
+	if !strings.Contains(notice, "仍需显式加 -force") || !strings.Contains(notice, "2026-11-27") {
+		t.Fatalf("提示应点明历史时间与仍需显式放行: %s", notice)
+	}
+	// 场景或指纹不同：不提示，避免误导。
+	if ForceAuditNotice(records, ForceSceneUniqueIndex, "fp1") != "" ||
+		ForceAuditNotice(records, ForceScenePurgeSampling, "fp2") != "" {
+		t.Fatal("场景或指纹不一致时不应提示曾放行")
 	}
 }
 

@@ -7,13 +7,34 @@ import (
 
 func TestVerifyConclusionCallsOutMissingNumericFields(t *testing.T) {
 	// 回归：numeric_fields 为空时只跑了记录数/分块/抽样，不能输出"全部通过"。
-	none := verifyConclusion("orders", 5, 0)
+	none := verifyConclusion("orders", 5, 0, true)
 	if !strings.Contains(none, "未配置 verify.numeric_fields") || strings.Contains(none, "全部通过") {
 		t.Fatalf("未配置数值列时结论必须点明缺口，且不能说全部通过: %s", none)
 	}
-	full := verifyConclusion("orders", 12, 3)
+	full := verifyConclusion("orders", 12, 3, true)
 	if !strings.Contains(full, "校验全部通过（12 项）") {
 		t.Fatalf("配置了数值列时应给出常规结论: %s", full)
+	}
+}
+
+func TestVerifyConclusionCallsOutDisabledSampling(t *testing.T) {
+	// 回归：关掉抽样后 verify 曾静默输出"全部通过"，与 purge 的门禁提示不一致。
+	noSample := verifyConclusion("orders", 12, 3, false)
+	if strings.Contains(noSample, "全部通过") || !strings.Contains(noSample, "抽样已关闭") {
+		t.Fatalf("抽样关闭时结论必须点明缺口，且不能说全部通过: %s", noSample)
+	}
+	// 数值列和抽样都关掉时，两处缺口都要说清楚。
+	both := verifyConclusion("orders", 5, 0, false)
+	if strings.Contains(both, "全部通过") ||
+		!strings.Contains(both, "未配置 verify.numeric_fields") ||
+		!strings.Contains(both, "抽样已关闭") {
+		t.Fatalf("两项都缺时结论应点明两处缺口: %s", both)
+	}
+	notice := SamplingDisabledNotice("orders", "verify")
+	for _, want := range []string{"orders", "verify", "sample_rounds", "行级错位", "逐字段抽查"} {
+		if !strings.Contains(notice, want) {
+			t.Fatalf("统一提示缺少 %q: %s", want, notice)
+		}
 	}
 }
 
@@ -117,6 +138,9 @@ func TestPurgeSQLBuilders(t *testing.T) {
 }
 
 func TestBuildSampleWhereByKey(t *testing.T) {
+	// 起点 0 表示"从头"，所以不加过滤条件；负数只可能是没读进断点，同样按从头处理。
+	// 这建立在"主键恒为正整数"的前提上：搬运前已用 JudgeNonPositiveKey 拒绝主键 <=0 的源表，
+	// 因此起点 0 不会与"已搬到主键 0"的真实进度混淆。
 	if BuildSampleWhereByKey("id", 0) != "" || BuildSampleWhereByKey("id", -1) != "" {
 		t.Fatal("起点为 0 或负数时不应加过滤条件")
 	}
@@ -129,6 +153,39 @@ func TestBuildSampleWhereByKey(t *testing.T) {
 	}
 	if sampleWhere("") != "" {
 		t.Fatal("空条件不应产生 WHERE")
+	}
+}
+
+func TestBuildSampleReviewSQLWithArchiveCondition(t *testing.T) {
+	results := []ReviewItemResult{{Label: "抽样第1轮逐字段比对（2行）", Verdict: "通过", Detail: "2 行所有可比对列一致（生成列除外）"}}
+	rounds := [][]int64{{11, 22}}
+	limited := BuildSampleReviewSQLWithArchiveCondition("orders", "orders_archive", "created_at < '2024-01-01'",
+		"`id` > 5000", "id", results, rounds, 4242, testTolerances())
+	for _, want := range []string{
+		"归档表抽样范围: `id` > 5000",
+		"WHERE `id` IN (11,22) AND (`id` > 5000) ORDER BY `id`;   -- 归档表",
+	} {
+		if !strings.Contains(limited, want) {
+			t.Fatalf("续跑抽样复查 SQL 缺少 %q:\n%s", want, limited)
+		}
+	}
+	plain := BuildSampleReviewSQL("orders", "orders_archive", "", "id", results, rounds, 4242, testTolerances())
+	if strings.Contains(plain, "归档表抽样范围") || strings.Contains(plain, "`id` > 5000") {
+		t.Fatalf("全量抽样复查 SQL 不应带续跑范围: %s", plain)
+	}
+}
+
+func TestFormatSampleDiffs(t *testing.T) {
+	diffs := []RowDiff{
+		{Key: 7, Reason: "主键在源表中不存在（可能已被 purge 删除）"},
+		{Key: 8, Column: "amount", Src: "100", Dst: "200", Reason: "数值不相等"},
+	}
+	got := formatSampleDiffs(diffs)
+	if !strings.Contains(got, "主键7：主键在源表中不存在") || !strings.Contains(got, "主键8 字段amount") {
+		t.Fatalf("整行缺失与字段差异应分开表述: %s", got)
+	}
+	if strings.Contains(got, "列缺失") {
+		t.Fatalf("整行缺失不应被写成列缺失: %s", got)
 	}
 }
 

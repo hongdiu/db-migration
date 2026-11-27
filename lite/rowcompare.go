@@ -1,13 +1,14 @@
 // 抽样行的逐字段比对。
 //
-// 对抽中的每个主键，分别回读源表和归档表的全部字段，逐字段比对。
+// 对抽中的每个主键，分别回读源表和归档表的所有可比对列（生成列除外），逐字段比对。
 // 这能抓出求和/计数发现不了的行级错位：比如两行数据互换，两边 SUM 一样、COUNT 一样，
 // 但抽中其中一行回读时，该行的每个字段都对不上。
 //
 // 比对规则：
 //   - 数值列按类型：整数/定点小数零容差，浮点绝对+相对双容差（复用 CompareNumbers）。
 //   - 非数值列（文本、日期等）：按字符串精确比对。
-//   - NULL 与 0、空串严格区分；生成列跳过（两边都不能显式插入）。
+//   - NULL 与 0、空串严格区分；生成列跳过（两边都不能显式插入，只读比对也不纳入），
+//     所以报告里说的是"所有可比对列"，不是"全部字段"。
 package main
 
 import (
@@ -26,7 +27,7 @@ type RowDiff struct {
 	Reason string
 }
 
-// CompareSampledRow 比对单个主键在两张表的全部字段。
+// CompareSampledRow 比对单个主键在两张表的所有可比对列（生成列除外）。
 // srcRow / dstRow 都是 列名 -> 值 的映射，值用 NumericValue 保留 NULL 语义。
 // kinds 是列名 -> 数值类别（非数值列为 NumericNone）。
 // 返回该行的差异列表，空表示完全一致。
@@ -55,7 +56,7 @@ func displayValue(v NumericValue) string {
 	return v.Raw
 }
 
-// readRow 按主键回读一张表的全部字段。
+// readRow 按主键回读一张表的所有可比对列（生成列除外）。
 func readRow(ctx context.Context, db *sql.DB, table string, columns []string, keyCol string, key int64) (map[string]NumericValue, error) {
 	colList := strings.Join(columns, ",")
 	q := fmt.Sprintf("SELECT %s FROM %s WHERE %s = %d", colList, qIdent(table), qIdent(keyCol), key)
@@ -119,7 +120,20 @@ type SampleVerdict struct {
 	Sampled int // 本轮抽样行数
 }
 
-// CompareSampleRound 比对一轮抽样：逐主键回读两表全部字段并比对。
+// judgeSampleRowPresence 检查两侧是否都读到了这一行。
+// 整行缺失（部分 purge 后抽到已删主键时会遇到）和"某个字段缺列"是两类问题，
+// 前者必须说清是哪一侧没有这行，不能报成"列缺失"误导排查。
+func judgeSampleRowPresence(srcRow, dstRow map[string]NumericValue) (RowDiff, bool) {
+	if len(srcRow) == 0 {
+		return RowDiff{Reason: "主键在源表中不存在（可能已被 purge 删除，或搬运遗漏）"}, true
+	}
+	if len(dstRow) == 0 {
+		return RowDiff{Reason: "主键在归档表中不存在（可能尚未搬运）"}, true
+	}
+	return RowDiff{}, false
+}
+
+// CompareSampleRound 比对一轮抽样：逐主键回读两表所有可比对列（生成列除外）并比对。
 func CompareSampleRound(ctx context.Context, db *sql.DB, source, archive, keyCol string, columns []string, kinds map[string]NumericKind, keys []int64, tols Tolerances) (SampleVerdict, error) {
 	v := SampleVerdict{Round: 0, Pass: true, Sampled: len(keys)}
 	for _, key := range keys {
@@ -130,6 +144,12 @@ func CompareSampleRound(ctx context.Context, db *sql.DB, source, archive, keyCol
 		dstRow, err := readRow(ctx, db, archive, columns, keyCol, key)
 		if err != nil {
 			return v, fmt.Errorf("回读归档表主键 %d 失败: %w", key, err)
+		}
+		if d, missing := judgeSampleRowPresence(srcRow, dstRow); missing {
+			d.Key = key
+			v.Pass = false
+			v.Diffs = append(v.Diffs, d)
+			continue
 		}
 		diffs := CompareSampledRow(key, unquoteColumns(columns), kinds, srcRow, dstRow, tols)
 		if len(diffs) > 0 {

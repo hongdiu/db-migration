@@ -110,7 +110,7 @@ func TestReviewSQLRecordsSampleSeed(t *testing.T) {
 
 func TestBuildSampleReviewSQL(t *testing.T) {
 	rounds := [][]int64{{11, 22}, {33}}
-	results := []ReviewItemResult{{Label: "抽样第1轮逐字段比对（2行）", Verdict: "通过", Detail: "2 行全部字段一致"}}
+	results := []ReviewItemResult{{Label: "抽样第1轮逐字段比对（2行）", Verdict: "通过", Detail: "2 行所有可比对列一致（生成列除外）"}}
 	sql := BuildSampleReviewSQL("orders", "orders_archive", "created_at < '2024-01-01'", "id", results, rounds, 4242, testTolerances())
 	for _, want := range []string{"独立抽样核对复查 SQL", "抽样种子: 4242", "[通过] 抽样第1轮", "第 1 轮抽中 2 行", "WHERE `id` IN (11,22)", "WHERE `id` IN (33)"} {
 		if !strings.Contains(sql, want) {

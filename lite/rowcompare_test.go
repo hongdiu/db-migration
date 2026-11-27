@@ -110,6 +110,26 @@ func TestUnquoteColumns(t *testing.T) {
 	}
 }
 
+func TestJudgeSampleRowPresence(t *testing.T) {
+	row := map[string]NumericValue{"id": TextValue("1")}
+	if d, missing := judgeSampleRowPresence(row, row); missing {
+		t.Fatalf("两侧都有行时不应报缺失: %+v", d)
+	}
+	// 源表整行不存在：部分 purge 后抽到已删主键的典型场景。
+	d, missing := judgeSampleRowPresence(nil, row)
+	if !missing || !strings.Contains(d.Reason, "源表") || !strings.Contains(d.Reason, "purge") {
+		t.Fatalf("源表整行缺失应说明可能已被 purge: %+v", d)
+	}
+	if strings.Contains(d.Reason, "列缺失") {
+		t.Fatalf("整行缺失不能被写成列缺失: %s", d.Reason)
+	}
+	// 归档表整行不存在：搬运遗漏。
+	d, missing = judgeSampleRowPresence(row, nil)
+	if !missing || !strings.Contains(d.Reason, "归档表") {
+		t.Fatalf("归档表整行缺失应明确是哪一侧: %+v", d)
+	}
+}
+
 func TestDisplayValue(t *testing.T) {
 	if displayValue(NullValue()) != "NULL" {
 		t.Fatal("NULL 展示不对")

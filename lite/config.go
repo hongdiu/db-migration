@@ -66,14 +66,15 @@ type VerifyCfg struct {
 	// 超过上限时自动放大块宽，宁可定位精度变粗也不让校验跑不起来。
 	BlockCountMax int `yaml:"block_count_max"`
 	// AbsTolerance FLOAT 的绝对容差，默认 0.0001。
-	AbsTolerance float64 `yaml:"abs_tolerance"`
+	// 用指针承载，是为了区分"没配"和"显式配 0"：显式 0 表示零容差（必须完全相等）。
+	AbsTolerance *float64 `yaml:"abs_tolerance"`
 	// RelTolerance FLOAT 的相对容差，默认 0.00001。
-	RelTolerance float64 `yaml:"rel_tolerance"`
+	RelTolerance *float64 `yaml:"rel_tolerance"`
 	// DoubleAbsTolerance DOUBLE 的绝对容差，默认 1e-9。
 	// DOUBLE 的有效数字比 FLOAT 多一倍以上，用 FLOAT 那组阈值会把它的真实差异放过。
-	DoubleAbsTolerance float64 `yaml:"double_abs_tolerance"`
+	DoubleAbsTolerance *float64 `yaml:"double_abs_tolerance"`
 	// DoubleRelTolerance DOUBLE 的相对容差，默认 1e-12。
-	DoubleRelTolerance float64 `yaml:"double_rel_tolerance"`
+	DoubleRelTolerance *float64 `yaml:"double_rel_tolerance"`
 	// SampleRounds 抽样轮数，默认 3；设为 0 关闭抽样。
 	// 用指针区分"未配置"和"显式配 0"，避免默认值覆盖关闭意图。
 	SampleRounds *int `yaml:"sample_rounds"`
@@ -102,12 +103,21 @@ func (v VerifyCfg) SampleEnabled() bool {
 	return v.Rounds() > 0 && v.PerRound() > 0
 }
 
+// toleranceValue 返回容差的最终值；未配置时用默认值。
+// 配置用指针承载，是为了让"显式配 0"和"没配"能区分开。
+func toleranceValue(v *float64, def float64) float64 {
+	if v == nil {
+		return def
+	}
+	return *v
+}
+
 // Tolerances 返回两类浮点各自使用的比对阈值。
 // 配置里分开存，跑校验时由字段类型自动取对应的一组。
 func (v VerifyCfg) Tolerances() Tolerances {
 	return Tolerances{
-		Float:  Tolerance{Abs: v.AbsTolerance, Rel: v.RelTolerance},
-		Double: Tolerance{Abs: v.DoubleAbsTolerance, Rel: v.DoubleRelTolerance},
+		Float:  Tolerance{Abs: toleranceValue(v.AbsTolerance, 0.0001), Rel: toleranceValue(v.RelTolerance, 0.00001)},
+		Double: Tolerance{Abs: toleranceValue(v.DoubleAbsTolerance, 1e-9), Rel: toleranceValue(v.DoubleRelTolerance, 1e-12)},
 	}
 }
 
@@ -157,20 +167,31 @@ func (c *Config) applyDefaults() error {
 		if t.Verify.BlockCountMax > 100000 {
 			return fmt.Errorf("tables[%d].verify.block_count_max 不能超过 100000", i)
 		}
-		if t.Verify.AbsTolerance == 0 {
-			t.Verify.AbsTolerance = 0.0001
-		}
-		if t.Verify.RelTolerance == 0 {
-			t.Verify.RelTolerance = 0.00001
-		}
+		// 容差：未配置用默认值，显式配 0 保留为零容差，负数一律拒绝。
+		abs := toleranceValue(t.Verify.AbsTolerance, 0.0001)
+		rel := toleranceValue(t.Verify.RelTolerance, 0.00001)
 		// DOUBLE 的默认阈值比 FLOAT 严一到两个数量级：1e-9 / 1e-12。
 		// 与 README 的说明保持一致，不再是"文档写了、代码没有"。
-		if t.Verify.DoubleAbsTolerance == 0 {
-			t.Verify.DoubleAbsTolerance = 1e-9
+		dabs := toleranceValue(t.Verify.DoubleAbsTolerance, 1e-9)
+		drel := toleranceValue(t.Verify.DoubleRelTolerance, 1e-12)
+		for _, tc := range []struct {
+			name  string
+			value float64
+		}{
+			{"abs_tolerance", abs},
+			{"rel_tolerance", rel},
+			{"double_abs_tolerance", dabs},
+			{"double_rel_tolerance", drel},
+		} {
+			if tc.value < 0 {
+				return fmt.Errorf("tables[%d].verify.%s 不能为负数", i, tc.name)
+			}
 		}
-		if t.Verify.DoubleRelTolerance == 0 {
-			t.Verify.DoubleRelTolerance = 1e-12
-		}
+		// 回写具体值，便于调试与后续取值口径一致。
+		t.Verify.AbsTolerance = &abs
+		t.Verify.RelTolerance = &rel
+		t.Verify.DoubleAbsTolerance = &dabs
+		t.Verify.DoubleRelTolerance = &drel
 		// 抽样参数：未配置时用方法里的默认值；这里只把显式配置值校验到合法范围。
 		rounds := t.Verify.Rounds()
 		perRound := t.Verify.PerRound()
@@ -237,6 +258,14 @@ func (t *TableCfg) validate(label string) error {
 	case ModeFullTable:
 		if strings.TrimSpace(t.Condition) != "" {
 			return fmt.Errorf("%s 全表模式不允许配置 condition", label)
+		}
+		// 全表模式会建一张"表名__new_empty"的临时空表，MySQL 表名上限 64 字符。
+		// 等建表时再失败就晚了，配置校验阶段直接拦住并说清楚。
+		const maxMySQLTableLen = 64
+		const emptySuffix = "__new_empty"
+		if len(t.Name)+len(emptySuffix) > maxMySQLTableLen {
+			return fmt.Errorf("%s.name 加上临时表名后缀 %q 共 %d 字符，超过 MySQL 表名 64 字符上限；请缩短表名（最多 %d 字符）",
+				label, emptySuffix, len(t.Name)+len(emptySuffix), maxMySQLTableLen-len(emptySuffix))
 		}
 	case ModeConditional:
 		if strings.TrimSpace(t.Condition) == "" {

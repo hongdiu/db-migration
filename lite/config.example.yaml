@@ -13,7 +13,9 @@
 #   dbmigration-lite -config config.yaml -action purge
 #   dbmigration-lite -config config.yaml -action verify -table orders   # 只处理某张表
 #
-# -force 只在两处需要：全表模式源表带触发器/外键、purge 关闭了抽样。其余预检不可绕过。
+# -force 只在三处需要：条件模式搬运时源表带不含主键列的唯一索引（如 UNIQUE(order_no)）、
+#   全表模式源表带触发器/外键/非主键自增列、purge 关闭了抽样。其余预检不可绕过。
+#   包含主键列的唯一索引（如 UNIQUE(id, tenant)）不引入跨行覆盖风险，默认放行。
 
 database:
   dsn: "user:pass@tcp(127.0.0.1:3306)/appdb?parseTime=true"
@@ -21,14 +23,15 @@ database:
   max_idle_conns: 5
 
 output:
-  dir: ./migration-output        # 复查 SQL、报告输出目录
+  dir: ./migration-output        # 复查 SQL 输出目录
 
 checkpoint:
   dir: ./migration-checkpoints   # 断点进度目录
 
 tables:
   # 全表模式：表不再写入，直接用改名 + 建空表归档，瞬间完成、不搬数据、天然无误删风险。
-  # 注意：本表若带触发器或自己的外键，改名后新表不带这些对象，默认拒绝，确认可接受再加 -force。
+  # 注意：本表若带触发器、自己的外键，或存在不会被对齐的非主键自增列，
+  #       改名后新表不带这些对象/计数器，默认拒绝，确认可接受再加 -force。
   - name: logs
     mode: full_table
     archive_table: logs_archive
@@ -38,20 +41,22 @@ tables:
     mode: conditional
     archive_table: orders_archive
     condition: "created_at < '2024-01-01 00:00:00'"   # 条件列必须不随时间被 UPDATE
-    key_column: id                  # 留空则自动探测；条件模式要求单列整型主键
+    key_column: id                  # 留空则自动探测；条件模式要求单列正整数主键（值>0，游标从 0 开始）
     batch_size: 5000                # 每批行数
     verify:
       numeric_fields: [amount, fee] # 数值校验列，类型自动探测后按类型比对。
                                     # 留空则跳过求和/最值/非空数，结论会写明"未校验数值列"
       block_size: 100000            # 主键分块大小，用于定位差异落在哪一段
       block_count_max: 1000         # 分块数量上限；雪花 ID 等大跨度主键会把块宽自动放大
+      # 四组容差都可显式配 0 表示零容差（必须完全相等）；配负数会在启动时被拒绝。
       abs_tolerance: 0.0001         # FLOAT 绝对容差（整数、定点小数始终零容差）
       rel_tolerance: 0.00001        # FLOAT 相对容差
       double_abs_tolerance: 1e-9    # DOUBLE 绝对容差；分精度设阈值，不沿用 FLOAT 那组
       double_rel_tolerance: 1e-12   # DOUBLE 相对容差
-      # 随机抽样逐行比对：从归档表按主键抽样，抽中行回读两张表全部字段逐字段比对。
+      # 随机抽样逐行比对：从归档表按主键抽样，抽中行回读两张表所有可比对列（生成列除外）逐字段比对。
       # 能抓出"两行数据互换"这类求和/计数发现不了的错误，用于部分数据迁移场景。
       # 主路径是"主键区间随机探针取点"，开销与样本数成正比；小表或空洞极多时降级为顺序扫描。
-      # total = sample_rounds × sample_size。purge 前抽样被关掉时会拒绝删除（可加 -force）。
+      # total = sample_rounds × sample_size。抽样关掉时 verify 会在结论里写明缺口（不会说"全部通过"），
+      # purge 则默认拒绝删除（可加 -force）。
       sample_rounds: 3              # 轮数，默认 3；设为 0 关闭抽样
       sample_size: 50               # 每轮条数，默认 50；total 默认 150 行

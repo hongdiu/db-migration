@@ -192,22 +192,20 @@ func primaryIndexColumns(idxs []IndexMeta, keyCol string) []string {
 	return nil
 }
 
-// sameColumnSet 比较两组列名是否构成同一组（忽略顺序与大小写）。
-// 唯一索引的约束只取决于列集合，UNIQUE(a,b) 与 UNIQUE(b,a) 等价。
-func sameColumnSet(a, b []string) bool {
-	if len(a) != len(b) || len(a) == 0 {
+// containsAllColumns 判断 cols 是否包含 required 里的全部列（忽略顺序与大小写）。
+// required 为空时返回 false：没有主键列可依时，不能盲目豁免任何唯一索引。
+func containsAllColumns(cols, required []string) bool {
+	if len(required) == 0 || len(cols) == 0 {
 		return false
 	}
-	seen := make(map[string]int, len(a))
-	for _, c := range a {
-		seen[strings.ToLower(c)]++
+	seen := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		seen[strings.ToLower(c)] = true
 	}
-	for _, c := range b {
-		k := strings.ToLower(c)
-		if seen[k] == 0 {
+	for _, c := range required {
+		if !seen[strings.ToLower(c)] {
 			return false
 		}
-		seen[k]--
 	}
 	return true
 }
@@ -221,8 +219,9 @@ func sameColumnSet(a, b []string) bool {
 // 那条记录就此消失，而记录数、求和、最值、非空数、分块计数全都不会变，只有抽样碰巧
 // 抽中才看得出。错误数据一旦通过闸门，purge 会按归档表主键清单删掉源表，原值无从恢复。
 //
-// 与主键列完全相同的唯一索引（如 UNIQUE(id)）不引入新的冲突面：命中它必然也命中主键，
-// 效果与主键覆盖一致，不算风险。
+// 包含主键列的唯一索引（如 UNIQUE(id)、UNIQUE(id, tenant)）不引入新的冲突面：
+// 主键保证任意两行的主键值必不相同，索引键里带了主键列，两个不同主键的行索引键必然不同，
+// 冲突只可能落在主键相同的同一行，效果与主键覆盖一致，不算风险。
 func upsertConflictIndexes(idxs []IndexMeta, keyCol string) []IndexMeta {
 	primary := primaryIndexColumns(idxs, keyCol)
 	var out []IndexMeta
@@ -230,7 +229,7 @@ func upsertConflictIndexes(idxs []IndexMeta, keyCol string) []IndexMeta {
 		if !idx.Unique || strings.EqualFold(idx.Name, "PRIMARY") {
 			continue
 		}
-		if sameColumnSet(idx.Columns, primary) {
+		if containsAllColumns(idx.Columns, primary) {
 			continue
 		}
 		out = append(out, idx)
@@ -246,7 +245,7 @@ func judgeUpsertUniqueIndexes(sourceTable string, idxs []IndexMeta, keyCol strin
 		return nil
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("源表 %s 上存在主键之外的唯一索引。条件模式搬运写入用的是 INSERT ... ON DUPLICATE KEY UPDATE，", sourceTable))
+	sb.WriteString(fmt.Sprintf("源表 %s 上存在不包含主键列的唯一索引。条件模式搬运写入用的是 INSERT ... ON DUPLICATE KEY UPDATE，", sourceTable))
 	sb.WriteString("而 MySQL 在任何唯一索引冲突时都会触发它，不只主键：")
 	for _, idx := range conflicts {
 		sb.WriteString(fmt.Sprintf("\n  - 唯一索引 %s（%s）", idx.Name, strings.Join(idx.Columns, ", ")))
