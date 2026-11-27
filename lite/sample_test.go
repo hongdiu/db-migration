@@ -2,6 +2,7 @@ package main
 
 import (
 	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -234,6 +235,24 @@ func TestPickSampleCandidates(t *testing.T) {
 			t.Fatalf("选中主键不应重复: %+v", chosen)
 		}
 		seen[k] = true
+	}
+}
+
+func TestSampleScanFallbackNotice(t *testing.T) {
+	// 样本数超区间上限：提示必须点明"超过上限"这个根因，不能只说候选不足。
+	big := SampleScanFallbackNotice(100000, 10000)
+	for _, want := range []string{"100000", "超过分区取点上限", "逐行返回", "不会全部驻留内存"} {
+		if !strings.Contains(big, want) {
+			t.Fatalf("超上限提示应包含 %q，实际：%s", want, big)
+		}
+	}
+	// 小表或空洞导致的降级：不能误说成样本数超上限。
+	small := SampleScanFallbackNotice(150, 120)
+	if strings.Contains(small, "超过分区取点上限") {
+		t.Fatalf("小表降级不应误报超上限: %s", small)
+	}
+	if !strings.Contains(small, "主键空洞") || !strings.Contains(small, "逐行返回") {
+		t.Fatalf("小表降级提示应说明空洞与逐行读取: %s", small)
 	}
 }
 

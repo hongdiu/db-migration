@@ -228,7 +228,8 @@ func RunCopy(ctx context.Context, db *sql.DB, cfg *Config, t *TableCfg, keyCol s
 			lastPercent = pct
 		}
 	}
-	// 确保最终进度是 100%，并换行，让后续的核对结果另起一行。
+	// 最后一行按实际完成比例显示并换行：正常搬完是 100%，若期间数据被外部删改导致少搬，
+	// 这里会如实显示不足 100%，作为需要排查的信号，不写死 100% 掩盖问题。
 	fmt.Print("\r" + BuildProgressLine(rowsDone, total, ProgressPercent(rowsDone, total), time.Since(started)) + "\n")
 	return nil
 }

@@ -173,6 +173,24 @@ func sampleWhere(condition string) string {
 	return " WHERE (" + condition + ")"
 }
 
+// maxProbeRanges 是分区取点的区间上限。每个区间最多贡献一个候选，
+// 因此样本数一旦超过它，分区路径必然凑不齐候选、一定退化为流式扫描。
+const maxProbeRanges = 10000
+
+// SampleScanFallbackNotice 生成"退化为流式扫描"的提示。
+// needed 是需要的样本总数，candidates 是分区路径实际取到的候选数。
+func SampleScanFallbackNotice(needed, candidates int) string {
+	reason := "表较小或主键空洞较多，分区取点凑不够样本"
+	if needed > maxProbeRanges {
+		reason = fmt.Sprintf("样本数 %d 超过分区取点上限 %d，候选最多只有 %d 条",
+			needed, maxProbeRanges, maxProbeRanges)
+	}
+	return fmt.Sprintf("注意: 本次抽样退化为流式扫描（%s，实际取到 %d 个候选）："+
+		"数据库会逐行返回归档表全部主键；程序里只保留抽中的 %d 行、不会全部驻留内存，"+
+		"但大表上传输和扫描会明显变慢。如需避免，把 sample_rounds × sample_size 控制在 %d 以内。",
+		reason, candidates, needed, maxProbeRanges)
+}
+
 // SampleKeysWithCondition 在附加过滤条件下抽样。
 // 删除续跑时传入"主键 > 上次删除位置"，只对尚未删除的部分做校验。
 func SampleKeysWithCondition(ctx context.Context, db *sql.DB, table, keyCol, condition string, rounds, size int, seed int64) ([][]int64, error) {
@@ -193,10 +211,11 @@ func SampleKeysWithCondition(ctx context.Context, db *sql.DB, table, keyCol, con
 	// 第二步：每个区间用随机探针取一条最近的候选。冗余系数 3 用于对抗主键空洞。
 	var candidates []int64
 	if lo.Valid && hi.Valid {
-		// 区间数最多 10000（配置里单轮上限 10000 × 轮数上限 100 × 3 会过大，这里封顶）。
+		// 区间数封顶 maxProbeRanges：配置里单轮上限 10000 × 轮数上限 100 × 3 会过大。
+		// 每个区间最多出一个候选，因此样本数超过上限时分区路径必然凑不齐，走降级。
 		rangeCount := needed * 3
-		if rangeCount > 10000 {
-			rangeCount = 10000
+		if rangeCount > maxProbeRanges {
+			rangeCount = maxProbeRanges
 		}
 		ranges := MakeSampleRanges(lo.Int64, hi.Int64, rangeCount)
 		probes := ProbePoints(ranges, rng)
@@ -215,7 +234,9 @@ func SampleKeysWithCondition(ctx context.Context, db *sql.DB, table, keyCol, con
 	if ok {
 		return ShuffleAndSplit(chosen, rounds, size, rng), nil
 	}
-	// 候选不足：小表或空洞极多，降级为原来的流式蓄水池扫描。
+	// 候选不足：小表或空洞极多，或样本数超过区间上限（此时必然不足），
+	// 降级为原来的流式蓄水池扫描。降级必须显式提示，不能静默换路径。
+	fmt.Println(SampleScanFallbackNotice(needed, len(candidates)))
 	return sampleKeysByScan(ctx, db, table, keyCol, where, rounds, size, rng)
 }
 
