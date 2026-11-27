@@ -43,15 +43,6 @@ func BuildCopyQuery(source, archive string, columns []string, keyCol, condition 
 		qIdent(archive), colList, selectSQL, strings.Join(updates, ","))
 }
 
-// BuildArchiveCountQuery 生成归档表行数统计（条件模式归档表只装命中数据，全表即全部）。
-func BuildArchiveCountQuery(archive, condition string) string {
-	q := fmt.Sprintf("SELECT COUNT(*) FROM %s", qIdent(archive))
-	if condition != "" {
-		q += " WHERE " + condition
-	}
-	return q
-}
-
 // ProgressPercent 计算搬运完成百分比，截断到 0~100。
 // total<=0 表示没有命中数据，直接算作完成，避免除零。
 func ProgressPercent(done, total int64) int {
@@ -249,12 +240,11 @@ type PurgeVerdict struct {
 	DeletedSoFar    int64 // 本次任务已删行数（续跑场景）
 	ArchiveRows     int64 // 归档表对应行数
 	BatchRows       int64 // 本批打算删除的主键个数
-	IsFinalBatch    bool  // 是否最后一批
 }
 
 // JudgePurgeAllowed 判断本批删除是否允许。
-// 守恒式：待删 + 已删 == 归档行数，且不得超出。
-// 最后一批还要求归档侧不能再多，确保没有漏搬或多搬。
+// 守恒式：待删 + 已删 必须严格等于归档行数——多出来说明归档数据不足，
+// 少了说明还有没搬完的行，两个方向都不允许删。
 func JudgePurgeAllowed(v PurgeVerdict) error {
 	if v.SrcRowsToDelete < 0 || v.DeletedSoFar < 0 || v.ArchiveRows < 0 || v.BatchRows < 0 {
 		return fmt.Errorf("计数出现负数，数据异常")

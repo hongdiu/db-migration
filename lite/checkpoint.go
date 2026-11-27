@@ -165,12 +165,3 @@ func SaveCheckpoint(dir, table string, cp *Checkpoint) error {
 	}
 	return nil
 }
-
-// RemoveCheckpoint 删除进度文件（全部完成后清理）。
-func RemoveCheckpoint(dir, table string) error {
-	err := os.Remove(checkpointPath(dir, table))
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}

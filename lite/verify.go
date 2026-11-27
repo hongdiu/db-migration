@@ -16,11 +16,9 @@ import (
 
 // CheckResult 是单个核对项的结果。
 type CheckResult struct {
-	Label   string // 核对项名称，如 "记录数"、"分块[0,99999]计数"
-	Pass    bool
-	Detail  string
-	BlockLo int64 // 关联的主键分块下界；非分块项为 0
-	BlockHi int64 // 关联的主键分块上界；非分块项为 0
+	Label  string // 核对项名称，如 "记录数"、"分块[0,99999]计数"（分块区间写在标签里）
+	Pass   bool
+	Detail string
 }
 
 // BlockRange 是一个主键分块区间 [lo, hi]。
@@ -82,27 +80,14 @@ func FitBlockSize(minKey, maxKey, blockSize int64, maxBlocks int) int64 {
 }
 
 // JudgeCounts 判定两个计数是否相等（记录数和分块计数都是零容差）。
-func JudgeCounts(label string, srcCount, dstCount int64, block BlockRange) CheckResult {
-	r := CheckResult{Label: label, BlockLo: block.Lo, BlockHi: block.Hi}
+// 分块的区间已经写在 label 里，差异定位靠它，不再单独携带区间字段。
+func JudgeCounts(label string, srcCount, dstCount int64) CheckResult {
+	r := CheckResult{Label: label}
 	if srcCount == dstCount {
 		r.Pass = true
 		r.Detail = fmt.Sprintf("两侧均为 %d 行", srcCount)
 	} else {
 		r.Detail = fmt.Sprintf("行数不等：源=%d，归档=%d，差=%d", srcCount, dstCount, srcCount-dstCount)
-	}
-	return r
-}
-
-// JudgeNumericAggregate 按字段类型判定一个聚合值（求和或最值）。
-func JudgeNumericAggregate(label string, src, dst string, kind NumericKind, tols Tolerances, nullable bool) CheckResult {
-	r := CheckResult{Label: label}
-	// 从数据库读出的 NULL 用 sql.NullString 语义识别：这里约定空表示 NULL 由调用方传入 IsNull。
-	sv, dv := TextValue(src), TextValue(dst)
-	ok, detail := CompareNumbers(sv, dv, kind, tols)
-	r.Pass = ok
-	r.Detail = detail
-	if nullable {
-		r.Detail += "（该列可空，NULL 已按独立值处理）"
 	}
 	return r
 }
@@ -201,17 +186,6 @@ func AllPassed(results []CheckResult) bool {
 		}
 	}
 	return true
-}
-
-// FailedBlocks 收集校验未通过的分块区间，作为删除门禁的排除项。
-func FailedBlocks(results []CheckResult) []BlockRange {
-	var out []BlockRange
-	for _, r := range results {
-		if !r.Pass && (r.BlockLo != 0 || r.BlockHi != 0) {
-			out = append(out, BlockRange{Lo: r.BlockLo, Hi: r.BlockHi})
-		}
-	}
-	return out
 }
 
 // ResultsToReviewItems 把校验结果转成复查 SQL 里的工具判定汇总项。

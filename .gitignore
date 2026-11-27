@@ -1,5 +1,8 @@
 # 构建产物
 bin/
+# 手工交叉编译到源码目录的二进制（正式构建走 lite/build_test.sh，输出在 bin/）
+/lite/db-migration-*
+/lite/dbmigration-lite
 # 运行产物
 migration-reports/
 migration-checkpoints/

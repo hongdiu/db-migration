@@ -114,22 +114,3 @@ func TestConfigFingerprintSensitivity(t *testing.T) {
 		t.Fatal("校验字段变化应改变指纹")
 	}
 }
-
-func TestRemoveCheckpoint(t *testing.T) {
-	dir := t.TempDir()
-	cp := &Checkpoint{Fingerprint: "abc", Table: "orders"}
-	if err := SaveCheckpoint(dir, "orders", cp); err != nil {
-		t.Fatal(err)
-	}
-	if err := RemoveCheckpoint(dir, "orders"); err != nil {
-		t.Fatalf("删除失败: %v", err)
-	}
-	got, _ := LoadCheckpoint(dir, "orders")
-	if got != nil {
-		t.Fatal("删除后应为 nil")
-	}
-	// 重复删除不报错。
-	if err := RemoveCheckpoint(dir, "orders"); err != nil {
-		t.Fatalf("重复删除不应报错: %v", err)
-	}
-}

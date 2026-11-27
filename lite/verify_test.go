@@ -58,16 +58,11 @@ func TestFitBlockSize(t *testing.T) {
 }
 
 func TestJudgeCounts(t *testing.T) {
-	block := BlockRange{Lo: 0, Hi: 99}
-	if r := JudgeCounts("分块计数", 100, 100, block); !r.Pass {
+	if r := JudgeCounts("分块计数", 100, 100); !r.Pass {
 		t.Fatalf("相等应通过: %+v", r)
 	}
-	r := JudgeCounts("分块计数", 100, 98, block)
-	if r.Pass {
+	if r := JudgeCounts("分块计数", 100, 98); r.Pass {
 		t.Fatal("不等应失败")
-	}
-	if r.BlockLo != 0 || r.BlockHi != 99 {
-		t.Fatalf("分块信息应保留: %+v", r)
 	}
 }
 
@@ -92,49 +87,23 @@ func TestJudgeNonNullCounts(t *testing.T) {
 	}
 }
 
-func TestJudgeNumericAggregateByType(t *testing.T) {
-	// 整数：差 1 失败。
-	if r := JudgeNumericAggregate("求和", "100", "101", NumericInteger, testTolerances(), false); r.Pass {
-		t.Fatal("整数差 1 应失败")
-	}
-	// 定点小数：写法差异通过。
-	if r := JudgeNumericAggregate("求和", "1.0", "1.00", NumericDecimal, testTolerances(), false); !r.Pass {
-		t.Fatal("定点小数写法差异应通过")
-	}
-	// 浮点：容差内通过。
-	if r := JudgeNumericAggregate("求和", "1.00005", "1.0", NumericFloat, testTolerances(), false); !r.Pass {
-		t.Fatal("浮点容差内应通过")
-	}
-	// 浮点：超容差失败。
-	if r := JudgeNumericAggregate("求和", "1.001", "1.0", NumericFloat, testTolerances(), false); r.Pass {
-		t.Fatal("浮点超容差应失败")
-	}
-	// NULL 与 0 不等。
-	if r := JudgeNumericAggregate("求和", "", "0", NumericDecimal, testTolerances(), true); r.Pass {
-		t.Fatal("NULL 与 0 不应相等")
-	}
-}
-
-func TestAllPassedAndFailedBlocks(t *testing.T) {
+func TestAllPassed(t *testing.T) {
 	results := []CheckResult{
 		{Label: "记录数", Pass: true},
-		{Label: "块1", Pass: true, BlockLo: 0, BlockHi: 99},
-		{Label: "块2", Pass: false, BlockLo: 100, BlockHi: 199},
+		{Label: "分块[0,99]计数", Pass: true},
+		{Label: "分块[100,199]计数", Pass: false},
 	}
 	if AllPassed(results) {
 		t.Fatal("有失败项时不应全部通过")
 	}
-	failed := FailedBlocks(results)
-	if len(failed) != 1 || failed[0] != (BlockRange{100, 199}) {
-		t.Fatalf("失败分块提取不对: %+v", failed)
-	}
-	// 全部通过时 FailedBlocks 为空。
+	// 全部通过时判定为真。
 	results[2].Pass = true
 	if !AllPassed(results) {
 		t.Fatal("全部通过判定失败")
 	}
-	if got := FailedBlocks(results); len(got) != 0 {
-		t.Fatalf("全通过时失败分块应为空: %+v", got)
+	// 空结果视为通过（没有可比对项），与调用方语义一致。
+	if !AllPassed(nil) {
+		t.Fatal("空结果应视为通过")
 	}
 }
 

@@ -74,7 +74,7 @@ func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey, seed
 	if err != nil {
 		return nil, fmt.Errorf("统计归档表行数失败: %w", err)
 	}
-	results = append(results, JudgeCounts("记录数", srcCount, archiveCount, BlockRange{}))
+	results = append(results, JudgeCounts("记录数", srcCount, archiveCount))
 
 	// 2. 字段类型探测。
 	fields, err := buildReviewFields(ctx, db, t.Name, t.Verify.NumericFields)
@@ -149,7 +149,7 @@ func RunVerifyRange(ctx context.Context, db *sql.DB, t *TableCfg, startKey, seed
 				return nil, err
 			}
 			results = append(results, JudgeCounts(
-				fmt.Sprintf("分块[%d,%d]计数", block.Lo, block.Hi), sc, dc, block))
+				fmt.Sprintf("分块[%d,%d]计数", block.Lo, block.Hi), sc, dc))
 		}
 	}
 

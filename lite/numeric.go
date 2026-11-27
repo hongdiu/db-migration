@@ -161,13 +161,3 @@ func compareFloat(a, b string, kind NumericKind, tol Tolerance) (bool, string) {
 	}
 	return false, fmt.Sprintf("%s 超出容差：差值=%g，阈值=%g（绝对 %g + 相对 %g × %g）", kind, diff, limit, tol.Abs, tol.Rel, scale)
 }
-
-// SumColumnType 根据列的数据库类型返回求和结果应按哪类比对。
-// 整数、定点小数求和结果仍是精确值；浮点求和按容差。
-func SumCompareKind(dataType string) NumericKind {
-	k := NumericKindFromDBType(dataType)
-	if k == NumericNone {
-		return NumericNone
-	}
-	return k
-}
